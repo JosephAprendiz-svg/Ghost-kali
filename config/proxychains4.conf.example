@@ -1,0 +1,9 @@
+# proxychains4 example (dynamic chain) - no subir con datos sensibles
+strict_chain
+proxy_dns
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+
+[ProxyList]
+# referencia: usa Tor local
+socks5  127.0.0.1 9050

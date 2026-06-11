@@ -1,0 +1,10 @@
+# Nunca subir credenciales ni configs personales
+*.account
+*account*
+*token*
+*secret*
+*.key
+mullvad-*.conf
+wg-*.conf
+*.log
+.env

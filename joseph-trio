@@ -1,62 +1,50 @@
 #!/usr/bin/env bash
-#=====================================================================================
-#  GHOST-KALI  |  joseph-trio  v3.0
-#  Author : JosephAprendiz-svg
-#  License: MIT
-#  Desc   : Operational anonymity toolkit for Kali Linux.
-#           Orchestrates Mullvad (WireGuard) + Tor + Proxychains with a
-#           kill-switch, live dashboard, automatic Tor identity rotation
-#           and DNS-leak validation.
-#  WARNING: For educational and authorized penetration-testing use only.
-#===========================================================================================
-
+#==============================================================================
+# GHOST-KALI | joseph-trio v3.1
+# Author : JosephAprendiz-svg
+# License: MIT
+# Desc   : Operational anonymity toolkit for Kali Linux.
+#==============================================================================
 set -o pipefail
 
-# --- Palette ------------------------------------------------------------------
-readonly R=$'\033[0;31m' G=$'\033[0;32m' Y=$'\033[1;33m'
-readonly B=$'\033[0;34m' C=$'\033[0;36m' M=$'\033[0;35m'
-readonly W=$'\033[1;37m' D=$'\033[2m'   NC=$'\033[0m'
-
+readonly R=$$'\033[0;31m' G=$$'\033[0;32m' Y=$$'\033[1;33m'
+readonly B=$$'\033[0;34m' C=$$'\033[0;36m' M=$$'\033[0;35m'
+readonly W=$$'\033[1;37m' D=$$'\033[2m' NC=$$'\033[0m'
 readonly TOR_CTRL_PORT=9051
 readonly TOR_SOCKS="127.0.0.1:9050"
 
-# --- Helpers --------------------------------------------------------------------------
-log()  { printf '%b[*]%b %s\n'  "$C" "$NC" "$1"; }
-ok()   { printf '%b[+]%b %s\n'  "$G" "$NC" "$1"; }
-warn() { printf '%b[!]%b %s\n'  "$Y" "$NC" "$1"; }
-err()  { printf '%b[x]%b %s\n'  "$R" "$NC" "$1"; }
+log()  { printf '%b[*]%b %s\n' "$$C" "$NC" "$1"; }
+ok()   { printf '%b[+]%b %s\n' "$G" "$NC" "$$1"; }
+warn() { printf '%b[!]%b %s\n' "$$Y" "$NC" "$1"; }
+err()  { printf '%b[x]%b %s\n' "$R" "$NC" "$$1"; }
+pause(){ printf '\n%b' "$$D"; read -rp " Pulsa ENTER para volver al menu..." _; printf '%b' "$$NC"; }
 
-pause() { printf '\n%b' "$D"; read -rp "  Pulsa ENTER para volver al menu..." _; printf '%b' "$NC"; }
 require_root() {
-  if [[ $EUID -ne 0 ]]; then
+  if [[ $$EUID -ne 0 ]]; then
     err "Se requieren privilegios de root. Ejecuta: sudo joseph-trio"
     exit 1
   fi
 }
-
 require_deps() {
   local miss=()
   for bin in mullvad tor proxychains4 curl nc systemctl; do
-    command -v "$bin" >/dev/null 2>&1 || miss+=("$bin")
+    command -v "$$bin" >/dev/null 2>&1 || miss+=("$$bin")
   done
-  if ((${#miss[@]})); then
-    err "Faltan dependencias: ${miss[*]}"
+  if (($${#miss[@]})); then
+    err "Faltan dependencias: $${miss[*]}"
     warn "Instala con: sudo apt install -y tor proxychains4 curl netcat-openbsd"
     exit 1
   fi
 }
+pc_curl() { proxychains4 -q curl -s --max-time 15 "$$@" 2>/dev/null; }
 
-pc_curl() { proxychains4 -q curl -s --max-time 15 "$@" 2>/dev/null; }
-
-# --- Tor identity rotation ---------------------------------------------------
 tor_newnym() {
   printf 'authenticate ""\nsignal newnym\nquit\n' \
-    | nc 127.0.0.1 "$TOR_CTRL_PORT" >/dev/null 2>&1
+    | nc 127.0.0.1 "$$TOR_CTRL_PORT" >/dev/null 2>&1
 }
-
-# --- Public IP / geo via Tor --------------------------------------------------
 get_exit_ip()  { pc_curl https://api.ipify.org; }
 get_exit_geo() { pc_curl "https://ipapi.co/${1}/country_name"; }
+
 mode_privacy() {
   log "Activando modo Privacidad (solo Mullvad)..."
   mullvad lockdown-mode set on >/dev/null 2>&1
@@ -82,85 +70,147 @@ mode_anonymous() {
   log "Capa 3: Verificando salida real por Tor..."
   local check ip
   check=$(pc_curl https://check.torproject.org/api/ip)
-  ip=$(printf '%s' "$check" | grep -oE '"IP":"[^]]+"' | cut -d'"' -f4)
-  if printf '%s' "$check" | grep -q '"IsTor":true'; then
+  ip=$$(printf '%s' "$$check" | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
+  if printf '%s' "$$check" | grep -q '"IsTor":true'; then
     ok "Cadena verificada -> Tu PC > Mullvad > Tor > Internet"
-    printf '    %bIP de salida Tor:%b %s\n' "$W" "$NC" "${ip:-N/A}"
+    printf '   %bIP de salida Tor:%b %s\n' "$$W" "$NC" "${ip:-N/A}"
   else
     warn "La verificacion no confirmo salida por Tor. Revisa proxychains4.conf"
   fi
   pause
 }
+
 new_identity() {
   log "Solicitando nueva identidad a Tor..."
   tor_newnym; sleep 5
-  local ip; ip=$(get_exit_ip)
+  local ip; ip=$$(get_exit_ip)
   ok "Identidad rotada."
-  printf '    %bNueva IP de salida:%b %s | %bPais:%b %s\n' \
-    "$W" "$NC" "${ip:-N/A}" "$W" "$NC" "$(get_exit_geo "$ip")"
+  printf '   %bNueva IP de salida:%b %s | %bPais:%b %s\n' \
+    "$$W" "$NC" "${ip:-N/A}" "$W" "$NC" "$$(get_exit_geo "$$ip")"
   pause
 }
 
 auto_rotation() {
   local interval count=1
-  read -rp "  Intervalo de rotacion en segundos [60]: " interval
-  interval=${interval:-60}
-  log "Rotacion automatica cada ${interval}s. Ctrl+C para detener."
+  read -rp " Intervalo de rotacion en segundos [60]: " interval
+  interval=$${interval:-60}
+  log "Rotacion automatica cada $${interval}s. Ctrl+C para detener."
   echo
   trap 'echo; warn "Rotacion detenida."; sleep 1; return' INT
   while :; do
     tor_newnym; sleep 3
-    local ip; ip=$(get_exit_ip)
+    local ip; ip=$$(get_exit_ip)
     printf '%b[rot #%02d]%b IP: %b%-15s%b | Pais: %b%s%b | %s\n' \
-      "$C" "$count" "$NC" "$W" "${ip:-N/A}" "$NC" \
-      "$W" "$(get_exit_geo "$ip")" "$NC" "$(date +%H:%M:%S)"
+      "$$C" "$count" "$NC" "$W" "${ip:-N/A}" "$NC" \
+      "$W" "$$(get_exit_geo "$$ip")" "$NC" "$(date +%H:%M:%S)"
     ((count++)); sleep "$interval"
   done
   trap - INT
 }
+
 dashboard() {
   trap 'echo; warn "Saliendo del dashboard..."; sleep 1; return' INT
   while :; do
     clear
     local vpn ks tor_s ip geo
     mullvad status 2>/dev/null | grep -qi connected \
-      && vpn="${G}CONNECTED${NC}" || vpn="${R}DISCONNECTED${NC}"
+      && vpn="${G}CONNECTED$${NC}" || vpn="$${R}DISCONNECTED$${NC}"
     mullvad lockdown-mode get 2>/dev/null | grep -qi "on" \
-      && ks="${G}ON${NC}" || ks="${R}OFF${NC}"
+      && ks="$${G}ON$${NC}" || ks="$${R}OFF$${NC}"
     systemctl is-active --quiet tor \
-      && tor_s="${G}ACTIVE${NC}" || tor_s="${R}INACTIVE${NC}"
-    ip=$(get_exit_ip); geo=$(get_exit_geo "$ip")
-
+      && tor_s="$${G}ACTIVE$${NC}" || tor_s="$${R}INACTIVE$${NC}"
+    ip=$$(get_exit_ip); geo=$$(get_exit_geo "$$ip")
     printf '%b%s%b\n' "$M" "=============================================" "$NC"
-    printf '%b   GHOST-KALI  ::  LIVE DASHBOARD        %s%b\n' "$W" "$(date +%H:%M:%S)" "$NC"
-    printf '%b%s%b\n' "$M" "===============================================" "$NC"
-    printf '   %bVPN  (Mullvad)%b : %b\n' "$B" "$NC" "$vpn"
-    printf '   %bKill-Switch   %b : %b\n' "$B" "$NC" "$ks"
-    printf '   %bTor  service  %b : %b\n' "$B" "$NC" "$tor_s"
-    printf '   %bExit IP (Tor) %b : %b%s%b\n' "$B" "$NC" "$W" "${ip:-N/A}" "$NC"
-    printf '   %bExit country  %b : %b%s%b\n' "$B" "$NC" "$W" "${geo:-N/A}" "$NC"
-    printf '%b%s%b\n' "$M" "==============================================" "$NC"
+    printf '%b GHOST-KALI :: LIVE DASHBOARD   %s%b\n' "$W" "$(date +%H:%M:%S)" "$$NC"
+    printf '%b%s%b\n' "$$M" "=============================================" "$$NC"
+    printf '   %bVPN (Mullvad)%b : %b\n' "$$B" "$NC" "$vpn"
+    printf '   %bKill-Switch  %b : %b\n' "$B" "$NC" "$$ks"
+    printf '   %bTor service  %b : %b\n' "$$B" "$NC" "$tor_s"
+    printf '   %bExit IP (Tor)%b : %b%s%b\n' "$B" "$NC" "$W" "${ip:-N/A}" "$$NC"
+    printf '   %bExit country %b : %b%s%b\n' "$$B" "$NC" "$W" "$${geo:-N/A}" "$$NC"
+    printf '%b%s%b\n' "$M" "=============================================" "$NC"
     printf '   %bRefrescando cada 5s -- Ctrl+C para volver%b\n' "$Y" "$NC"
     sleep 5
   done
   trap - INT
 }
+
 security_test() {
   log "Ejecutando bateria de pruebas de seguridad..."
   echo
-  printf '  %bIP publica directa (sin proxy):%b\n' "$B" "$NC"
-  printf '    %s\n' "$(curl -s --max-time 10 https://api.ipify.org || echo 'N/A')"
+  printf '   %bIP publica directa (sin proxy):%b\n' "$B" "$NC"
+  printf '   %s\n' "$$(curl -s --max-time 10 https://api.ipify.org || echo 'N/A')"
   echo
-  printf '  %bEstado Mullvad:%b\n' "$B" "$NC"
-  mullvad status 2>/dev/null | sed 's/^/    /'
+  printf '   %bEstado Mullvad:%b\n' "$$B" "$$NC"
+  mullvad status 2>/dev/null | sed 's/^/   /'
   echo
-  printf '  %bChequeo de fugas DNS (Mullvad):%b\n' "$B" "$NC"
+  printf '   %bChequeo de fugas DNS (Mullvad):%b\n' "$$B" "$$NC"
   curl -s --max-time 10 https://am.i.mullvad.net/json 2>/dev/null \
-    | sed 's/,/\n    /g; s/^/    /'
+    | sed 's/,/\n   /g; s/^/   /'
   echo; echo
-  printf '  %bSalida via Tor:%b\n' "$B" "$NC"
-  pc_curl https://check.torproject.org/api/ip | sed 's/^/    /'
+  printf '   %bSalida via Tor:%b\n' "$$B" "$NC"
+  pc_curl https://check.torproject.org/api/ip | sed 's/^/   /'
   echo
+  pause
+}
+
+mode_sms_anonymous() {
+  log "Activando Modo SMS Anonimo (chat global via numero virtual)..."
+  echo
+  warn "Este modo enruta tu navegador por Mullvad + Tor + Proxychains"
+  warn "para que accedas al panel web de tu proveedor SMS (ej. Blacktel)"
+  warn "sin revelar tu IP ni tu identidad real."
+  echo
+  log "Capa 1: Conectando Mullvad (WireGuard) con kill-switch..."
+  mullvad lockdown-mode set on >/dev/null 2>&1
+  mullvad relay set tunnel-protocol wireguard >/dev/null 2>&1
+  mullvad connect >/dev/null 2>&1; sleep 4
+  if mullvad status 2>/dev/null | grep -qi "connected"; then
+    ok "Capa 1: Mullvad conectado."
+  else
+    err "Mullvad no conecto. Abortando por seguridad."; pause; return
+  fi
+  log "Capa 2: Iniciando servicio Tor..."
+  systemctl start tor; sleep 5
+  if systemctl is-active --quiet tor; then
+    ok "Capa 2: Tor activo."
+  else
+    err "Tor no inicio. Abortando por seguridad."; pause; return
+  fi
+  log "Capa 3: Verificando que la salida sea por Tor (sin fugas)..."
+  local check ip
+  check=$(pc_curl https://check.torproject.org/api/ip)
+  ip=$$(printf '%s' "$$check" | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
+  if printf '%s' "$$check" | grep -q '"IsTor":true'; then
+    ok "Cadena verificada -> Tu PC > Mullvad > Tor > Internet"
+    printf '   %bIP de salida Tor:%b %s | %bPais:%b %s\n' \
+      "$$W" "$NC" "${ip:-N/A}" "$W" "$NC" "$$(get_exit_geo "$$ip")"
+  else
+    err "No se confirmo salida por Tor. NO continues. Revisa proxychains4.conf"
+    pause; return
+  fi
+  echo
+  ok "Anonimato confirmado. Abriendo panel del proveedor SMS via Tor..."
+  echo
+  local sms_url="https://www.blacktel.io/en/login"
+  local browser=""
+  for b in firefox-esr firefox chromium chromium-browser google-chrome brave-browser; do
+    if command -v "$$b" >/dev/null 2>&1; then browser="$$b"; break; fi
+  done
+  if [[ -n "$browser" ]]; then
+    log "Navegador detectado: $browser"
+    log "Lanzando $$sms_url enrutado por Mullvad > Tor > Proxychains..."
+    proxychains4 -q "$$browser" "$$sms_url" >/dev/null 2>&1 &
+    ok "Navegador abierto. Inicia sesion en tu proveedor y envia tus SMS."
+    printf '   %bTu IP visible para el proveedor es la de Tor:%b %s\n' \
+      "$$W" "$NC" "${ip:-N/A}"
+  else
+    warn "No se encontro un navegador grafico instalado."
+    warn "Abre manualmente tu navegador asi (ejemplo):"
+    printf '   %bproxychains4 firefox %s%b\n' "$C" "$sms_url" "$NC"
+  fi
+  echo
+  warn "OPSEC: usa SIEMPRE este modo para entrar al panel. Nunca entres sin Tor."
   pause
 }
 
@@ -172,6 +222,7 @@ shutdown_all() {
   ok "Tor detenido, Mullvad desconectado, kill-switch OFF."
   pause
 }
+
 banner() {
   clear
   printf '%b' "$C"
@@ -179,27 +230,28 @@ banner() {
    _____ _               _      _  __     _ _
   / ____| |             | |    | |/ /    | (_)
  | |  __| |__   ___  ___| |_   | ' /__ _ | |_
- | | |_| '_ \ / _ \/ __| __|  |  < / ``|| | |
+ | | |_ | '_ \ / _ \/ __| __|  |  < / _` || | |
  | |__| | | | | (_) \__ \ |_   | . \ (_||| | |
-  \____|_| |_|\___/|___/\__|  |_|\_\__,_||_|_
+  \_____|_| |_|\___/|___/\__|  |_|\_\__,_||_|_|
 ART
-  printf '%b' "$NC"
-  printf '%b        joseph-trio  v3.0%b\n'          "$W" "$NC"
-  printf '%b        by JosephAprendiz-svg%b\n\n'    "$Y" "$NC"
+  printf '%b' "$$NC"
+  printf '%b        joseph-trio v3.1%b\n' "$$W" "$$NC"
+  printf '%b      by JosephAprendiz-svg%b\n\n' "$$Y" "$$NC"
 }
 
 menu() {
   banner
-  printf '%b  1)%b Modo Privacidad        %b(solo Mullvad)%b\n'                "$G" "$NC" "$D" "$NC"
-  printf '%b  2)%b Modo Anonimo Total     %b(Mullvad + Tor + Proxychains)%b\n' "$G" "$NC" "$D" "$NC"
-  printf '%b  3)%b Nueva identidad Tor    %b(manual)%b\n'                      "$G" "$NC" "$D" "$NC"
-  printf '%b  4)%b Kill-Switch ON\n'                                        "$G" "$NC"
-  printf '%b  5)%b Kill-Switch OFF\n'                                       "$G" "$NC"
-  printf '%b  6)%b Test de seguridad      %b(IP + fugas DNS)%b\n'             "$G" "$NC" "$D" "$NC"
-  printf '%b  7)%b Rotacion automatica    %b(IP Tor temporizada)%b\n'       "$M" "$NC" "$D" "$NC"
-  printf '%b  8)%b Dashboard en vivo\n'                                    "$M" "$NC"
-  printf '%b  9)%b Apagar todo\n'                                           "$R" "$NC"
-  printf '%b  0)%b Salir\n'                                          "$D" "$NC"
+  printf '%b  1)%b Modo Privacidad      %b(solo Mullvad)%b\n' "$$G" "$NC" "$D" "$$NC"
+  printf '%b  2)%b Modo Anonimo Total   %b(Mullvad + Tor + Proxychains)%b\n' "$$G" "$NC" "$D" "$$NC"
+  printf '%b  3)%b Nueva identidad Tor  %b(manual)%b\n' "$$G" "$NC" "$D" "$$NC"
+  printf '%b  4)%b Kill-Switch ON\n' "$$G" "$$NC"
+  printf '%b  5)%b Kill-Switch OFF\n' "$$G" "$$NC"
+  printf '%b  6)%b Test de seguridad    %b(IP + fugas DNS)%b\n' "$$G" "$NC" "$D" "$$NC"
+  printf '%b  7)%b Rotacion automatica  %b(IP Tor temporizada)%b\n' "$$M" "$NC" "$D" "$$NC"
+  printf '%b  8)%b Dashboard en vivo\n' "$$M" "$$NC"
+  printf '%b  S)%b Modo SMS Anonimo     %b(numero virtual via Tor)%b\n' "$$C" "$NC" "$D" "$$NC"
+  printf '%b  9)%b Apagar todo\n' "$$R" "$$NC"
+  printf '%b  0)%b Salir\n' "$$D" "$NC"
   echo
 }
 
@@ -208,22 +260,22 @@ main() {
   require_deps
   while :; do
     menu
-    read -rp "  Elige una opcion [0-9]: " opt
+    read -rp " Elige una opcion [0-9/S]: " opt
     echo
     case "$opt" in
-      1) mode_privacy   ;;
+      1) mode_privacy ;;
       2) mode_anonymous ;;
-      3) new_identity   ;;
-      4) mullvad lockdown-mode set on  >/dev/null 2>&1 && ok "Kill-Switch ON";  pause ;;
+      3) new_identity ;;
+      4) mullvad lockdown-mode set on  >/dev/null 2>&1 && ok "Kill-Switch ON"; pause ;;
       5) mullvad lockdown-mode set off >/dev/null 2>&1 && warn "Kill-Switch OFF"; pause ;;
-      6) security_test  ;;
-      7) auto_rotation  ;;
-      8) dashboard      ;;
-      9) shutdown_all   ;;
+      6) security_test ;;
+      7) auto_rotation ;;
+      8) dashboard ;;
+      s|S) mode_sms_anonymous ;;
+      9) shutdown_all ;;
       0) ok "Saliendo. Stay safe."; exit 0 ;;
       *) err "Opcion invalida."; sleep 1 ;;
     esac
   done
 }
-
 main "$@"

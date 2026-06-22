@@ -8,3 +8,5 @@ mullvad-*.conf
 wg-*.conf
 *.log
 .env
+README.md.bak
+9083{DEST}

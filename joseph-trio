@@ -1,243 +1,725 @@
 #!/usr/bin/env bash
-set -o pipefail
-readonly R=$'\033[0;31m' G=$'\033[0;32m' Y=$'\033[1;33m'
-readonly B=$'\033[0;34m' C=$'\033[0;36m' M=$'\033[0;35m'
-readonly W=$'\033[1;37m' D=$'\033[2m' NC=$'\033[0m'
-readonly TOR_CTRL_PORT=9051
-readonly TOR_SOCKS="127.0.0.1:9050"
-log()  { printf '%b[*]%b %s\n' "$C" "$NC" "$1"; }
-ok()   { printf '%b[+]%b %s\n' "$G" "$NC" "$1"; }
-warn() { printf '%b[!]%b %s\n' "$Y" "$NC" "$1"; }
-err()  { printf '%b[x]%b %s\n' "$R" "$NC" "$1"; }
-pause(){ printf '\n%b' "$D"; read -rp " Pulsa ENTER para volver al menu..." _; printf '%b' "$NC"; }
-require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    err "Se requieren privilegios de root. Ejecuta: sudo joseph-trio"
-    exit 1
-  fi
+# ──────────────────────────────────────────────────────────────────────────────
+#  joseph-trio — Orquestador principal de Ghost-Kali v5.0
+# ──────────────────────────────────────────────────────────────────────────────
+#  Carga las librerías de lib/, parsea flags, muestra el banner y presenta un
+#  menú interactivo de 12 opciones para orquestar Mullvad VPN + Tor + Proxychains.
+#
+#  ⚖️  DISCLAIMER ÉTICO/LEGAL: herramienta 100% DEFENSIVA. Solo opera sobre TU
+#      sistema Kali para proteger tu privacidad legítima. No ataca, no escanea
+#      redes ajenas, no explota nada. Uso educativo y ético; realiza auditorías
+#      solo sobre sistemas para los que tengas autorización explícita.
+#
+#  🔐 INVARIANTES:
+#      · No modifica archivos del sistema sin confirmación explícita del usuario.
+#      · No usa rm -rf, iptables -F, killall, pkill ni systemctl de forma
+#        indiscriminada (solo acciones puntuales, confirmadas y con --dry-run).
+#      · No imprime credenciales, tokens ni datos sensibles.
+#
+#  Este SÍ es un script ejecutable: ./joseph-trio
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Constantes configurables ──────────────────────────────────────────────────
+GHOST_VERSION=${GHOST_VERSION:-v5.0-elite}
+GHOST_NAME=${GHOST_NAME:-Ghost-Kali}
+GHOST_AUTHOR=${GHOST_AUTHOR:-JosephAprendiz-svg}
+GHOST_REPO=${GHOST_REPO:-https://github.com/JosephAprendiz-svg/Ghost-kali}
+GHOST_DRY_RUN=${GHOST_DRY_RUN:-0}
+GHOST_BANNER_MODE=${GHOST_BANNER_MODE:-full}
+
+# Estado interno (lo rellena el parseo / la resolución de rutas).
+GHOST_BASE_DIR=""
+GHOST_LIB_DIR=""
+GHOST_ACTION=""
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  HELPERS PRIVADOS
+# ──────────────────────────────────────────────────────────────────────────────
+
+# _trio_resolve_base_dir → detecta la raíz del proyecto (resolviendo symlinks).
+# POR QUÉ resolver symlinks: el script puede invocarse a través de un enlace en
+# /usr/local/bin; necesitamos la ruta real para encontrar lib/.
+_trio_resolve_base_dir() {
+    local src=${BASH_SOURCE[0]} dir
+    while [[ -L $src ]]; do
+        dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+        src=$(readlink "$src")
+        [[ $src != /* ]] && src="${dir}/${src}"
+    done
+    GHOST_BASE_DIR=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+    GHOST_LIB_DIR="${GHOST_BASE_DIR}/lib"
 }
-require_deps() {
-  local miss=()
-  for bin in mullvad tor proxychains4 curl nc systemctl; do
-    command -v "$bin" >/dev/null 2>&1 || miss+=("$bin")
-  done
-  if ((${#miss[@]})); then
-    err "Faltan dependencias: ${miss[*]}"
-    warn "Instala con: sudo apt install -y tor proxychains4 curl netcat-openbsd"
-    exit 1
-  fi
+
+# _trio_die MENSAJE [CÓDIGO] → error fatal limpio (usa log si está disponible).
+_trio_die() {
+    local msg=$1 code=${2:-1}
+    if declare -F log_error >/dev/null 2>&1; then
+        log_error "$msg"
+    else
+        printf 'ERROR: %s\n' "$msg" >&2
+    fi
+    exit "$code"
 }
-pc_curl() { proxychains4 -q curl -s --max-time 15 "$@" 2>/dev/null; }
-tor_newnym() {
-  printf 'authenticate ""\nsignal newnym\nquit\n' | nc 127.0.0.1 "$TOR_CTRL_PORT" >/dev/null 2>&1
+
+# _trio_confirm MENSAJE → pregunta sí/no (devuelve 0 si sí). En modo no
+# interactivo (confirmación previa o automatización) devuelve 0 sin preguntar.
+_trio_confirm() {
+    [[ ${GHOST_NON_INTERACTIVE:-0} == 1 ]] && return 0
+    printf '%s%s%s [s/N]: ' "${C_WARNING:-}" "$1" "${C_RESET:-}"
+    local ans
+    read -r ans || return 1
+    [[ $ans =~ ^[sSyY]$ ]]
 }
-get_exit_ip()  { pc_curl https://api.ipify.org; }
-get_exit_geo() { pc_curl "https://ipapi.co/${1}/country_name"; }
-mode_privacy() {
-  log "Activando modo Privacidad (solo Mullvad)..."
-  mullvad lockdown-mode set on >/dev/null 2>&1
-  mullvad relay set tunnel-protocol wireguard >/dev/null 2>&1
-  mullvad connect >/dev/null 2>&1
-  sleep 4
-  if mullvad status 2>/dev/null | grep -qi "connected"; then
-    ok "Mullvad conectado con kill-switch activo."
-    mullvad status
-  else
-    err "No se pudo establecer la conexion Mullvad."
-  fi
-  pause
+
+# _trio_press_enter → pausa hasta ENTER (no pausa en modo no interactivo).
+_trio_press_enter() {
+    [[ ${GHOST_NON_INTERACTIVE:-0} == 1 ]] && return 0
+    printf '\n%sPulsa ENTER para continuar…%s' "${C_MUTED:-}" "${C_RESET:-}"
+    read -r _ || true
 }
-mode_anonymous() {
-  log "Levantando cadena de anonimato total..."
-  mullvad lockdown-mode set on >/dev/null 2>&1
-  mullvad connect >/dev/null 2>&1; sleep 4
-  ok "Capa 1: Mullvad (WireGuard) conectado."
-  systemctl start tor; sleep 5
-  ok "Capa 2: Servicio Tor iniciado."
-  log "Capa 3: Verificando salida real por Tor..."
-  local check ip
-  check=$(pc_curl https://check.torproject.org/api/ip)
-  ip=$(printf '%s' "$check" | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
-  if printf '%s' "$check" | grep -q '"IsTor":true'; then
-    ok "Cadena verificada -> Tu PC > Mullvad > Tor > Internet"
-    printf '   %bIP de salida Tor:%b %s\n' "$W" "$NC" "${ip:-N/A}"
-  else
-    warn "La verificacion no confirmo salida por Tor. Revisa proxychains4.conf"
-  fi
-  pause
+
+# _trio_clear → limpia la pantalla de forma portable (solo si es una terminal).
+_trio_clear() {
+    if declare -F dashboard_clear_screen >/dev/null 2>&1; then
+        dashboard_clear_screen
+        return 0
+    fi
+    [[ -t 1 ]] || return 0
+    if command -v tput >/dev/null 2>&1 && tput clear 2>/dev/null; then
+        return 0
+    fi
+    printf '\033[2J\033[H'
 }
-new_identity() {
-  log "Solicitando nueva identidad a Tor..."
-  tor_newnym; sleep 5
-  local ip; ip=$(get_exit_ip)
-  ok "Identidad rotada."
-  printf '   %bNueva IP de salida:%b %s | %bPais:%b %s\n' "$W" "$NC" "${ip:-N/A}" "$W" "$NC" "$(get_exit_geo "$ip")"
-  pause
+
+# _trio_cleanup → restaura el terminal al salir (cursor visible).
+_trio_cleanup() {
+    command -v tput >/dev/null 2>&1 && tput cnorm 2>/dev/null || true
 }
-auto_rotation() {
-  local interval count=1
-  read -rp " Intervalo de rotacion en segundos [60]: " interval
-  interval=${interval:-60}
-  log "Rotacion automatica cada ${interval}s. Ctrl+C para detener."
-  echo
-  trap 'echo; warn "Rotacion detenida."; sleep 1; return' INT
-  while :; do
-    tor_newnym; sleep 3
-    local ip; ip=$(get_exit_ip)
-    printf '%b[rot #%02d]%b IP: %b%-15s%b | Pais: %b%s%b | %s\n' "$C" "$count" "$NC" "$W" "${ip:-N/A}" "$NC" "$W" "$(get_exit_geo "$ip")" "$NC" "$(date +%H:%M:%S)"
-    ((count++)); sleep "$interval"
-  done
-  trap - INT
+
+# _trio_on_int → manejador de Ctrl+C: avisa sin romper bruscamente.
+_trio_on_int() {
+    printf '\n'
+    if declare -F log_warn >/dev/null 2>&1; then
+        log_warn "Interrupción recibida (Ctrl+C)."
+    fi
 }
-dashboard() {
-  trap 'echo; warn "Saliendo del dashboard..."; sleep 1; return' INT
-  while :; do
-    clear
-    local vpn ks tor_s ip geo
-    mullvad status 2>/dev/null | grep -qi connected && vpn="${G}CONNECTED${NC}" || vpn="${R}DISCONNECTED${NC}"
-    mullvad lockdown-mode get 2>/dev/null | grep -qi "on" && ks="${G}ON${NC}" || ks="${R}OFF${NC}"
-    systemctl is-active --quiet tor && tor_s="${G}ACTIVE${NC}" || tor_s="${R}INACTIVE${NC}"
-    ip=$(get_exit_ip); geo=$(get_exit_geo "$ip")
-    printf '%b%s%b\n' "$M" "=============================================" "$NC"
-    printf '%b GHOST-KALI :: LIVE DASHBOARD   %s%b\n' "$W" "$(date +%H:%M:%S)" "$NC"
-    printf '%b%s%b\n' "$M" "=============================================" "$NC"
-    printf '   %bVPN (Mullvad)%b : %b\n' "$B" "$NC" "$vpn"
-    printf '   %bKill-Switch  %b : %b\n' "$B" "$NC" "$ks"
-    printf '   %bTor service  %b : %b\n' "$B" "$NC" "$tor_s"
-    printf '   %bExit IP (Tor)%b : %b%s%b\n' "$B" "$NC" "$W" "${ip:-N/A}" "$NC"
-    printf '   %bExit country %b : %b%s%b\n' "$B" "$NC" "$W" "${geo:-N/A}" "$NC"
-    printf '%b%s%b\n' "$M" "=============================================" "$NC"
-    printf '   %bRefrescando cada 5s -- Ctrl+C para volver%b\n' "$Y" "$NC"
-    sleep 5
-  done
-  trap - INT
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CARGA DE LIBRERÍAS, AYUDA Y VERSIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+# trio_load_libs → carga todas las librerías de lib/ en el orden de dependencias.
+trio_load_libs() {
+    local lib path
+    local -a libs=(colors logger validators torctl vpnctl netutils dashboard banner)
+    local -a missing=()
+    for lib in "${libs[@]}"; do
+        path="${GHOST_LIB_DIR}/${lib}.sh"
+        if [[ -f $path ]]; then
+            # shellcheck source=/dev/null
+            source "$path"
+        else
+            missing+=("lib/${lib}.sh")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        _trio_die "Faltan librerías: ${missing[*]}. Ejecuta ./install.sh o clona el repositorio completo." 2
+    fi
+
+    # Aplica preferencias de presentación ya parseadas.
+    if [[ ${GHOST_BANNER_NO_COLOR:-0} == 1 ]] && declare -F set_color_mode >/dev/null 2>&1; then
+        set_color_mode none
+    elif declare -F apply_theme >/dev/null 2>&1; then
+        apply_theme "${GHOST_THEME:-ghost}" >/dev/null 2>&1 || true
+    fi
 }
-security_test() {
-  log "Ejecutando bateria de pruebas de seguridad..."
-  echo
-  printf '   %bIP publica directa (sin proxy):%b\n' "$B" "$NC"
-  printf '   %s\n' "$(curl -s --max-time 10 https://api.ipify.org || echo 'N/A')"
-  echo
-  printf '   %bEstado Mullvad:%b\n' "$B" "$NC"
-  mullvad status 2>/dev/null | sed 's/^/   /'
-  echo
-  printf '   %bChequeo de fugas DNS (Mullvad):%b\n' "$B" "$NC"
-  curl -s --max-time 10 https://am.i.mullvad.net/json 2>/dev/null | sed 's/,/\n   /g; s/^/   /'
-  echo; echo
-  printf '   %bSalida via Tor:%b\n' "$B" "$NC"
-  pc_curl https://check.torproject.org/api/ip | sed 's/^/   /'
-  echo
-  pause
+
+# trio_show_help → ayuda formateada (no depende de las librerías).
+trio_show_help() {
+    cat <<EOF
+${GHOST_NAME} ${GHOST_VERSION} — Toolkit defensivo de anonimato (Mullvad + Tor + Proxychains)
+
+Uso: ./joseph-trio [opciones]
+
+Opciones:
+  -h, --help            Muestra esta ayuda y sale.
+  -v, --version         Muestra la versión y sale.
+      --dry-run         Modo simulación: no realiza cambios reales.
+      --no-color        Desactiva los colores ANSI.
+      --no-fade         Desactiva la animación del banner.
+      --banner-mode M   Modo de banner: full | minimal | classic | retro.
+      --check           Verificación rápida de salud del toolkit.
+      --dashboard       Entra directamente al dashboard en bucle.
+      --connect         Conecta Mullvad + Tor + Proxychains (modo automático).
+      --disconnect      Desconecta todo de forma segura.
+      --status          Muestra el estado resumido del trio.
+
+Sin opciones: muestra el banner y el menú interactivo.
+
+Uso educativo y ético. Protege tu privacidad legítima; no facilita abusos.
+Realiza auditorías solo sobre sistemas para los que tengas autorización.
+EOF
 }
-mode_sms_anonymous() {
-  log "Activando Modo SMS Anonimo (chat global via numero virtual)..."
-  echo
-  warn "Este modo enruta tu navegador por Mullvad + Tor + Proxychains"
-  warn "para que accedas al panel web de tu proveedor SMS (ej. Blacktel)"
-  warn "sin revelar tu IP ni tu identidad real."
-  echo
-  log "Capa 1: Conectando Mullvad (WireGuard) con kill-switch..."
-  mullvad lockdown-mode set on >/dev/null 2>&1
-  mullvad relay set tunnel-protocol wireguard >/dev/null 2>&1
-  mullvad connect >/dev/null 2>&1; sleep 4
-  if mullvad status 2>/dev/null | grep -qi "connected"; then
-    ok "Capa 1: Mullvad conectado."
-  else
-    err "Mullvad no conecto. Abortando por seguridad."; pause; return
-  fi
-  log "Capa 2: Iniciando servicio Tor..."
-  systemctl start tor; sleep 5
-  if systemctl is-active --quiet tor; then
-    ok "Capa 2: Tor activo."
-  else
-    err "Tor no inicio. Abortando por seguridad."; pause; return
-  fi
-  log "Capa 3: Verificando que la salida sea por Tor (sin fugas)..."
-  local check ip
-  check=$(pc_curl https://check.torproject.org/api/ip)
-  ip=$(printf '%s' "$check" | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
-  if printf '%s' "$check" | grep -q '"IsTor":true'; then
-    ok "Cadena verificada -> Tu PC > Mullvad > Tor > Internet"
-    printf '   %bIP de salida Tor:%b %s | %bPais:%b %s\n' "$W" "$NC" "${ip:-N/A}" "$W" "$NC" "$(get_exit_geo "$ip")"
-  else
-    err "No se confirmo salida por Tor. NO continues. Revisa proxychains4.conf"
-    pause; return
-  fi
-  echo
-  ok "Anonimato confirmado. Abriendo panel del proveedor SMS via Tor..."
-  echo
-  local sms_url="https://www.blacktel.io/en/login"
-  local browser=""
-  for b in firefox-esr firefox chromium chromium-browser google-chrome brave-browser; do
-    if command -v "$b" >/dev/null 2>&1; then browser="$b"; break; fi
-  done
-  if [[ -n "$browser" ]]; then
-    log "Navegador detectado: $browser"
-    log "Lanzando $sms_url enrutado por Mullvad > Tor > Proxychains..."
-    proxychains4 -q "$browser" "$sms_url" >/dev/null 2>&1 &
-    ok "Navegador abierto. Inicia sesion en tu proveedor y envia tus SMS."
-    printf '   %bTu IP visible para el proveedor es la de Tor:%b %s\n' "$W" "$NC" "${ip:-N/A}"
-  else
-    warn "No se encontro un navegador grafico instalado."
-    warn "Abre manualmente tu navegador asi (ejemplo):"
-    printf '   %bproxychains4 firefox %s%b\n' "$C" "$sms_url" "$NC"
-  fi
-  echo
-  warn "OPSEC: usa SIEMPRE este modo para entrar al panel. Nunca entres sin Tor."
-  pause
+
+# trio_show_version → versión y créditos (no depende de las librerías).
+trio_show_version() {
+    cat <<EOF
+${GHOST_NAME} ${GHOST_VERSION}
+Autor:    ${GHOST_AUTHOR}
+Repo:     ${GHOST_REPO}
+Licencia: MIT
+
+Toolkit defensivo de anonimato para Kali Linux. 100% educativo y ético.
+EOF
 }
-shutdown_all() {
-  log "Desconectando todo..."
-  systemctl stop tor 2>/dev/null
-  mullvad disconnect >/dev/null 2>&1
-  mullvad lockdown-mode set off >/dev/null 2>&1
-  ok "Tor detenido, Mullvad desconectado, kill-switch OFF."
-  pause
-}
-banner() {
-  clear
-  printf '%b' "$C"
-  printf '   GHOST-KALI\n'
-  printf '%b' "$NC"
-  printf '%b        joseph-trio v3.1%b\n' "$W" "$NC"
-  printf '%b      by JosephAprendiz-svg%b\n\n' "$Y" "$NC"
-}
-menu() {
-  banner
-  printf '%b  1)%b Modo Privacidad      %b(solo Mullvad)%b\n' "$G" "$NC" "$D" "$NC"
-  printf '%b  2)%b Modo Anonimo Total   %b(Mullvad + Tor + Proxychains)%b\n' "$G" "$NC" "$D" "$NC"
-  printf '%b  3)%b Nueva identidad Tor  %b(manual)%b\n' "$G" "$NC" "$D" "$NC"
-  printf '%b  4)%b Kill-Switch ON\n' "$G" "$NC"
-  printf '%b  5)%b Kill-Switch OFF\n' "$G" "$NC"
-  printf '%b  6)%b Test de seguridad    %b(IP + fugas DNS)%b\n' "$G" "$NC" "$D" "$NC"
-  printf '%b  7)%b Rotacion automatica  %b(IP Tor temporizada)%b\n' "$M" "$NC" "$D" "$NC"
-  printf '%b  8)%b Dashboard en vivo\n' "$M" "$NC"
-  printf '%b  S)%b Modo SMS Anonimo     %b(numero virtual via Tor)%b\n' "$C" "$NC" "$D" "$NC"
-  printf '%b  9)%b Apagar todo\n' "$R" "$NC"
-  printf '%b  0)%b Salir\n' "$D" "$NC"
-  echo
-}
-main() {
-  require_root
-  require_deps
-  while :; do
-    menu
-    read -rp " Elige una opcion [0-9/S]: " opt
-    echo
-    case "$opt" in
-      1) mode_privacy ;;
-      2) mode_anonymous ;;
-      3) new_identity ;;
-      4) mullvad lockdown-mode set on  >/dev/null 2>&1 && ok "Kill-Switch ON"; pause ;;
-      5) mullvad lockdown-mode set off >/dev/null 2>&1 && warn "Kill-Switch OFF"; pause ;;
-      6) security_test ;;
-      7) auto_rotation ;;
-      8) dashboard ;;
-      s|S) mode_sms_anonymous ;;
-      9) shutdown_all ;;
-      0) ok "Saliendo. Stay safe."; exit 0 ;;
-      *) err "Opcion invalida."; sleep 1 ;;
+
+# trio_parse_args → parsea todos los flags de línea de comandos.
+trio_parse_args() {
+    local a
+    while [[ $# -gt 0 ]]; do
+        a=$1
+        case $a in
+            -h | --help)
+                trio_show_help
+                exit 0
+                ;;
+            -v | --version)
+                trio_show_version
+                exit 0
+                ;;
+            --dry-run) GHOST_DRY_RUN=1 ;;
+            --no-color)
+                GHOST_BANNER_NO_COLOR=1
+                GHOST_NO_COLOR=1
+                ;;
+            --no-fade) GHOST_BANNER_NO_FADE=1 ;;
+            --banner-mode)
+                shift
+                GHOST_BANNER_MODE=${1:-full}
+                ;;
+            --banner-mode=*) GHOST_BANNER_MODE=${a#*=} ;;
+            --check) GHOST_ACTION=check ;;
+            --dashboard) GHOST_ACTION=dashboard ;;
+            --connect) GHOST_ACTION=connect ;;
+            --disconnect) GHOST_ACTION=disconnect ;;
+            --status) GHOST_ACTION=status ;;
+            *)
+                printf 'Opción desconocida: %s\n\n' "$a" >&2
+                trio_show_help
+                exit 2
+                ;;
+        esac
+        shift
+    done
+
+    # Validamos el modo de banner; si no es válido, caemos a full.
+    case ${GHOST_BANNER_MODE} in
+        full | minimal | classic | retro) ;;
+        *) GHOST_BANNER_MODE=full ;;
     esac
-  done
+
+    export GHOST_DRY_RUN GHOST_BANNER_MODE
+    export GHOST_BANNER_NO_COLOR GHOST_BANNER_NO_FADE GHOST_NO_COLOR 2>/dev/null || true
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  VALIDACIONES
+# ──────────────────────────────────────────────────────────────────────────────
+
+# trio_require_root → exige root salvo en --dry-run (la simulación no cambia nada).
+trio_require_root() {
+    local uid=${EUID:-$(id -u)}
+    if [[ $uid -eq 0 ]]; then
+        return 0
+    fi
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+        log_warn "No eres root, pero en --dry-run no se harán cambios. Continúo en simulación."
+        return 0
+    fi
+    log_error "Se requieren privilegios de root para gestionar red/túnel."
+    log_error "Ejecuta: sudo ./joseph-trio"
+    return 1
+}
+
+# trio_check_health → verificación de salud del toolkit (vía validators.sh).
+trio_check_health() {
+    if declare -F run_health_check >/dev/null 2>&1; then
+        run_health_check
+        return $?
+    fi
+    log_error "validators.sh no está cargado; no puedo ejecutar el health check."
+    return 1
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CONTROL DE TOR / PROXYCHAINS (helpers del orquestador)
+#  NOTA: torctl.sh gestiona un Tor YA en marcha (vía ControlPort). Arrancar o
+#  detener el servicio es una acción de systemd puntual, explícita y confirmada
+#  por el usuario (nunca indiscriminada), siempre con soporte de --dry-run.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# _trio_tor_start → inicia el servicio Tor (systemctl), respetando --dry-run.
+_trio_tor_start() {
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+        log_info "[dry-run] Ejecutaría: systemctl start tor"
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_error "systemctl no está disponible; inicia Tor manualmente."
+        return 1
+    fi
+    log_info "Iniciando el servicio Tor…"
+    if systemctl start tor 2>/dev/null; then
+        log_ok "Servicio Tor iniciado."
+        return 0
+    fi
+    log_error "No se pudo iniciar Tor (¿está instalado? ¿tienes permisos?)."
+    return 1
+}
+
+# _trio_tor_stop → detiene el servicio Tor (acción explícita y confirmada).
+_trio_tor_stop() {
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+        log_info "[dry-run] Ejecutaría: systemctl stop tor"
+        return 0
+    fi
+    _trio_confirm "¿Detener el servicio Tor?" || return 1
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_error "systemctl no está disponible; detén Tor manualmente."
+        return 1
+    fi
+    if systemctl stop tor 2>/dev/null; then
+        log_ok "Servicio Tor detenido."
+        return 0
+    fi
+    log_error "No se pudo detener Tor."
+    return 1
+}
+
+# _trio_proxychains_conf → imprime la ruta del proxychains.conf legible, si existe.
+_trio_proxychains_conf() {
+    local c
+    for c in /etc/proxychains4.conf /etc/proxychains.conf; do
+        [[ -r $c ]] && {
+            printf '%s' "$c"
+            return 0
+        }
+    done
+    return 1
+}
+
+# _trio_proxychains_check → verifica la configuración de proxychains (solo lectura).
+_trio_proxychains_check() {
+    local conf
+    if ! conf=$(_trio_proxychains_conf); then
+        log_warn "No se encontró un proxychains.conf legible."
+        return 1
+    fi
+    log_section "Proxychains"
+    local mode
+    mode=$(grep -E '^(dynamic_chain|strict_chain|random_chain)' "$conf" | head -1)
+    log_table "Config" "$conf" "Modo de cadena" "${mode:-?}"
+    if grep -Eq "^[[:space:]]*socks[45][[:space:]]+127\.0\.0\.1[[:space:]]+9050" "$conf"; then
+        log_ok "Proxychains enruta por el SOCKS de Tor (127.0.0.1:9050)."
+    else
+        log_warn "Proxychains NO apunta a 127.0.0.1:9050 (SOCKS de Tor)."
+    fi
+    log_info "Uso: antepón «proxychains4» a tu comando, p. ej.: proxychains4 firefox"
+}
+
+# _trio_proxychains_enable → «activa» proxychains (en realidad: verifica y guía).
+# POR QUÉ no es un servicio: proxychains se aplica por comando, no a nivel de
+# sistema. Ser honestos evita dar una falsa sensación de protección global.
+_trio_proxychains_enable() {
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+        log_info "[dry-run] Verificaría proxychains.conf y mostraría cómo usarlo."
+        return 0
+    fi
+    _trio_proxychains_check
+    log_info "Proxychains no es un servicio: queda listo para usarse con «proxychains4 <app>»."
+}
+
+# _trio_proxychains_disable → «desactiva» proxychains (no hay servicio que parar).
+_trio_proxychains_disable() {
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+        log_info "[dry-run] proxychains se aplica por comando; no hay servicio que detener."
+        return 0
+    fi
+    log_info "Proxychains deja de usarse simplemente al no anteponer «proxychains4»."
+    log_ok "Nada que desactivar a nivel de sistema."
+}
+
+# _trio_proxychains_change_chain → cambia el modo de cadena (con confirmación y
+# copia de seguridad). Modifica un archivo del sistema SOLO con consentimiento.
+_trio_proxychains_change_chain() {
+    local conf
+    if ! conf=$(_trio_proxychains_conf); then
+        log_error "No se encontró proxychains.conf."
+        return 1
+    fi
+    log_info "Modos: dynamic_chain (recomendado), strict_chain, random_chain."
+    printf 'Nuevo modo [dynamic/strict/random]: '
+    local m directive
+    read -r m || return 1
+    case ${m,,} in
+        dynamic) directive=dynamic_chain ;;
+        strict) directive=strict_chain ;;
+        random) directive=random_chain ;;
+        *)
+            log_error "Modo inválido."
+            return 1
+            ;;
+    esac
+
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+        log_info "[dry-run] Activaría «${directive}» en ${conf} (creando backup)."
+        return 0
+    fi
+    _trio_confirm "Esto modificará ${conf}. ¿Continuar?" || return 1
+    if [[ ! -w $conf ]]; then
+        log_error "Sin permiso de escritura en ${conf} (ejecuta como root)."
+        return 1
+    fi
+
+    cp -f "$conf" "${conf}.ghostbak.$(date +%s)" 2>/dev/null &&
+        log_info "Backup creado de ${conf}."
+    # Comentamos los tres modos y dejamos activo solo el elegido.
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*(dynamic_chain|strict_chain|random_chain)/#\1/' "$conf"
+    sed -i -E "s/^#?[[:space:]]*${directive}\b/${directive}/" "$conf"
+    log_ok "Modo de cadena cambiado a ${directive}."
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ACCIONES DE ALTO NIVEL
+# ──────────────────────────────────────────────────────────────────────────────
+
+# trio_connect_all → conecta Mullvad → Tor → Proxychains (opción 1 / --connect).
+trio_connect_all() {
+    log_section "Conectar todo: Mullvad → Tor → Proxychains"
+    log_warn "Esto cambiará el enrutamiento de tu tráfico para anonimizarlo."
+    _trio_confirm "¿Continuar con la conexión completa?" || {
+        log_warn "Conexión cancelada."
+        return 1
+    }
+
+    # Ya confirmaste; ejecutamos los pasos sin más prompts.
+    local prev_ni=${GHOST_NON_INTERACTIVE:-0}
+    GHOST_NON_INTERACTIVE=1
+
+    log_section "1/3 · Mullvad VPN"
+    if declare -F vpn_connect >/dev/null 2>&1; then vpn_connect; else log_warn "vpnctl no disponible."; fi
+
+    log_section "2/3 · Tor"
+    _trio_tor_start
+
+    log_section "3/3 · Proxychains"
+    _trio_proxychains_enable
+
+    GHOST_NON_INTERACTIVE=$prev_ni
+    log_ok "Secuencia de conexión completada. Verifica con la opción 3 (estado)."
+}
+
+# trio_disconnect_all → desconecta Proxychains → Tor → Mullvad (opción 2).
+trio_disconnect_all() {
+    log_section "Desconectar todo y limpiar"
+    _trio_confirm "¿Desconectar Proxychains, Tor y Mullvad?" || {
+        log_warn "Operación cancelada."
+        return 1
+    }
+
+    local prev_ni=${GHOST_NON_INTERACTIVE:-0}
+    GHOST_NON_INTERACTIVE=1
+
+    log_section "1/3 · Proxychains"
+    _trio_proxychains_disable
+
+    log_section "2/3 · Tor"
+    _trio_tor_stop
+
+    log_section "3/3 · Mullvad VPN"
+    if declare -F vpn_disconnect >/dev/null 2>&1; then vpn_disconnect; else log_warn "vpnctl no disponible."; fi
+
+    GHOST_NON_INTERACTIVE=$prev_ni
+    log_ok "Desconexión completada."
+}
+
+# trio_status → resumen del estado del trio (opción 3 / --status).
+trio_status() {
+    log_section "Estado del trio (Mullvad / Tor / Proxychains)"
+    declare -F vpn_status_panel >/dev/null 2>&1 && vpn_status_panel
+    declare -F tor_status_panel >/dev/null 2>&1 && tor_status_panel
+    _trio_proxychains_check
+    declare -F net_get_public_ip >/dev/null 2>&1 && net_get_public_ip
+}
+
+# trio_dashboard → entra al dashboard en bucle (opción 4 / --dashboard).
+trio_dashboard() {
+    if declare -F dashboard_loop >/dev/null 2>&1; then
+        dashboard_loop "${GHOST_DASH_REFRESH:-5}"
+        return $?
+    fi
+    log_error "dashboard.sh no está cargado."
+    return 1
+}
+
+# _trio_webrtc_guide → guía de WebRTC + URLs (opción 7). No abre el navegador.
+_trio_webrtc_guide() {
+    declare -F net_webrtc_leak_check >/dev/null 2>&1 && net_webrtc_leak_check
+    log_info "URLs de verificación (ábrelas tú mismo en tu navegador):"
+    log_info "  https://mullvad.net/check/"
+    log_info "  https://browserleaks.com/webrtc"
+}
+
+# _trio_hardening → hardening rápido (opción 11): IPv6, resolutores DNS y MAC.
+_trio_hardening() {
+    log_section "Hardening rápido"
+
+    # IPv6 (cambio de runtime, NO persistente, con confirmación y --dry-run).
+    local v6
+    v6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    log_info "IPv6 deshabilitado actualmente: ${v6:-desconocido}"
+    if [[ ${v6:-0} != 1 ]]; then
+        if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
+            log_info "[dry-run] Ejecutaría: sysctl -w net.ipv6.conf.all.disable_ipv6=1 (runtime)"
+        elif _trio_confirm "¿Desactivar IPv6 en runtime para evitar fugas? (no persistente)"; then
+            if sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 &&
+                sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1; then
+                log_ok "IPv6 desactivado en runtime."
+                log_info "Para hacerlo persistente, añádelo tú a /etc/sysctl.d/ (acción manual)."
+            else
+                log_error "No se pudo desactivar IPv6 (¿tienes permisos de root?)."
+            fi
+        fi
+    else
+        log_ok "IPv6 ya está deshabilitado."
+    fi
+
+    # Resolutores DNS.
+    declare -F net_dns_leak_test >/dev/null 2>&1 && net_dns_leak_test
+
+    # Aleatorización de MAC: solo verificación (cambiarla es una acción sensible).
+    log_section "Aleatorización de MAC (verificación)"
+    if command -v macchanger >/dev/null 2>&1; then
+        log_ok "macchanger está instalado; puedes aleatorizar tu MAC manualmente."
+    else
+        log_warn "macchanger no está instalado; sin él no puedes aleatorizar la MAC fácilmente."
+    fi
+    log_info "Este toolkit solo VERIFICA la MAC; no la cambia automáticamente."
+}
+
+# trio_about → acerca de / disclaimer (opción 12).
+trio_about() {
+    log_section "Acerca de ${GHOST_NAME}"
+    log_table "Versión" "$GHOST_VERSION" "Autor" "$GHOST_AUTHOR" \
+        "Repositorio" "$GHOST_REPO" "Licencia" "MIT"
+    log_section "Disclaimer ético y legal"
+    log_warn "Ghost-Kali es una herramienta DEFENSIVA para proteger la privacidad legítima."
+    log_info "• Úsalo solo con fines educativos, de investigación y auditorías AUTORIZADAS."
+    log_info "• El uso de VPN/Tor puede estar regulado en tu jurisdicción: cumple la ley local."
+    log_info "• No lo uses para acceder sin permiso a sistemas ajenos ni para fines ilícitos."
+    log_info "• El software se ofrece «tal cual», sin garantías. Asumes toda la responsabilidad."
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SUBMENÚS
+# ──────────────────────────────────────────────────────────────────────────────
+
+# _trio_menu_vpn → submenú de gestión de Mullvad (opción 8).
+_trio_menu_vpn() {
+    local c
+    while true; do
+        printf '\n  %s[a]%s Conectar   %s[b]%s Desconectar   %s[c]%s Cambiar relay   %s[0]%s Volver\n  > ' \
+            "${C_ACCENT:-}" "${C_RESET:-}" "${C_ACCENT:-}" "${C_RESET:-}" \
+            "${C_ACCENT:-}" "${C_RESET:-}" "${C_ACCENT:-}" "${C_RESET:-}"
+        read -r c || return 0
+        case ${c,,} in
+            a) declare -F vpn_connect >/dev/null 2>&1 && vpn_connect ;;
+            b) declare -F vpn_disconnect >/dev/null 2>&1 && vpn_disconnect ;;
+            c) _trio_vpn_change_relay ;;
+            0 | q) return 0 ;;
+            *) log_warn "Opción inválida." ;;
+        esac
+    done
+}
+
+# _trio_vpn_change_relay → pide país/ciudad y cambia el relay (vía vpnctl).
+_trio_vpn_change_relay() {
+    printf 'País (código de 2 letras, p. ej. se): '
+    local cc city
+    read -r cc || return 1
+    printf 'Ciudad (opcional, ENTER para omitir): '
+    read -r city || true
+    local -a args=("$cc")
+    [[ -n $city ]] && args+=("$city")
+    declare -F vpn_set_relay >/dev/null 2>&1 && vpn_set_relay "${args[@]}"
+}
+
+# _trio_menu_tor → submenú de gestión de Tor (opción 9).
+_trio_menu_tor() {
+    local c
+    while true; do
+        printf '\n  %s[a]%s Iniciar   %s[b]%s Detener   %s[c]%s Nuevo circuito   %s[d]%s Ver circuitos   %s[0]%s Volver\n  > ' \
+            "${C_ACCENT:-}" "${C_RESET:-}" "${C_ACCENT:-}" "${C_RESET:-}" \
+            "${C_ACCENT:-}" "${C_RESET:-}" "${C_ACCENT:-}" "${C_RESET:-}" \
+            "${C_ACCENT:-}" "${C_RESET:-}"
+        read -r c || return 0
+        case ${c,,} in
+            a) _trio_tor_start ;;
+            b) _trio_tor_stop ;;
+            c) declare -F tor_newnym >/dev/null 2>&1 && tor_newnym ;;
+            d) declare -F tor_get_circuits >/dev/null 2>&1 && tor_get_circuits ;;
+            0 | q) return 0 ;;
+            *) log_warn "Opción inválida." ;;
+        esac
+    done
+}
+
+# _trio_menu_proxychains → submenú de gestión de Proxychains (opción 10).
+_trio_menu_proxychains() {
+    local c
+    while true; do
+        printf '\n  %s[a]%s Verificar config   %s[b]%s Cambiar cadena   %s[0]%s Volver\n  > ' \
+            "${C_ACCENT:-}" "${C_RESET:-}" "${C_ACCENT:-}" "${C_RESET:-}" \
+            "${C_ACCENT:-}" "${C_RESET:-}"
+        read -r c || return 0
+        case ${c,,} in
+            a) _trio_proxychains_check ;;
+            b) _trio_proxychains_change_chain ;;
+            0 | q) return 0 ;;
+            *) log_warn "Opción inválida." ;;
+        esac
+    done
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MENÚ PRINCIPAL
+# ──────────────────────────────────────────────────────────────────────────────
+
+# trio_show_menu → dibuja el menú principal de 12 opciones.
+trio_show_menu() {
+    local p=${C_PRIMARY:-} a=${C_ACCENT:-} m=${C_MUTED:-} r=${C_RESET:-} modo
+    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then modo="SIMULACIÓN (--dry-run)"; else modo="real"; fi
+
+    printf '\n%s  Menú principal%s   %s(modo: %s)%s\n' "$p" "$r" "$m" "$modo" "$r"
+    printf '%s  ──────────────────────────────────────────────────────────%s\n' "$m" "$r"
+    printf '   %s[1]%s  Conectar todo (Mullvad → Tor → Proxychains)\n' "$a" "$r"
+    printf '   %s[2]%s  Desconectar todo y limpiar rutas\n' "$a" "$r"
+    printf '   %s[3]%s  Estado del trio (VPN / Tor / Proxychains)\n' "$a" "$r"
+    printf '   %s[4]%s  Dashboard en vivo\n' "$a" "$r"
+    printf '   %s[5]%s  Verificar IP pública y geolocalización\n' "$a" "$r"
+    printf '   %s[6]%s  Test de fugas DNS\n' "$a" "$r"
+    printf '   %s[7]%s  Test de fugas WebRTC (guía)\n' "$a" "$r"
+    printf '   %s[8]%s  Gestionar Mullvad VPN (conectar / desconectar / relay)\n' "$a" "$r"
+    printf '   %s[9]%s  Gestionar Tor (iniciar / nuevo circuito / ver circuitos)\n' "$a" "$r"
+    printf '  %s[10]%s  Gestionar Proxychains (verificar / cambiar cadena)\n' "$a" "$r"
+    printf '  %s[11]%s  Hardening rápido (IPv6, resolutores DNS, MAC)\n' "$a" "$r"
+    printf '  %s[12]%s  Acerca de / ayuda / disclaimer\n' "$a" "$r"
+    printf '\n   %s[0]%s  Salir\n' "$a" "$r"
+}
+
+# trio_handle_choice N → ejecuta la opción del menú. Devuelve 10 para salir.
+trio_handle_choice() {
+    case $1 in
+        1) trio_connect_all ;;
+        2) trio_disconnect_all ;;
+        3) trio_status ;;
+        4) trio_dashboard ;;
+        5) declare -F net_get_public_ip >/dev/null 2>&1 && net_get_public_ip ;;
+        6) declare -F net_dns_leak_test >/dev/null 2>&1 && net_dns_leak_test ;;
+        7) _trio_webrtc_guide ;;
+        8) _trio_menu_vpn ;;
+        9) _trio_menu_tor ;;
+        10) _trio_menu_proxychains ;;
+        11) _trio_hardening ;;
+        12) trio_about ;;
+        0) return 10 ;;
+        *) log_warn "Opción inválida: $1" ;;
+    esac
+    return 0
+}
+
+# trio_run_with_banner FUNC → muestra el banner y luego ejecuta la función dada.
+trio_run_with_banner() {
+    local fn=$1
+    declare -F banner_show >/dev/null 2>&1 && banner_show "${GHOST_BANNER_MODE:-full}"
+    "$fn"
+}
+
+# trio_menu_loop → bucle del menú interactivo.
+trio_menu_loop() {
+    local choice rc
+    while true; do
+        _trio_clear
+        declare -F banner_show >/dev/null 2>&1 && banner_show minimal --no-fade
+        trio_show_menu
+        printf '\n  %sSelecciona una opción [0-12]:%s ' "${C_PRIMARY:-}" "${C_RESET:-}"
+
+        read -r choice
+        rc=$?
+        if [[ $rc -gt 128 ]]; then
+            # Señal (p. ej. Ctrl+C): volvemos a dibujar el menú.
+            printf '\n'
+            continue
+        fi
+        if [[ $rc -ne 0 ]]; then
+            # EOF (Ctrl+D): salimos.
+            printf '\n'
+            break
+        fi
+        [[ -z $choice ]] && continue
+
+        trio_handle_choice "$choice"
+        [[ $? -eq 10 ]] && break
+        _trio_press_enter
+    done
+    log_info "Saliendo de ${GHOST_NAME}. Mantén tu privacidad. 🛡"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PUNTO DE ENTRADA
+# ──────────────────────────────────────────────────────────────────────────────
+main() {
+    _trio_resolve_base_dir
+    trio_parse_args "$@"
+    trio_load_libs
+
+    # Manejo de señales y restauración del terminal.
+    trap _trio_cleanup EXIT
+    trap _trio_on_int INT
+
+    # Acciones directas por flag (no entran al menú).
+    case ${GHOST_ACTION:-} in
+        check)
+            trio_check_health
+            exit $?
+            ;;
+        status)
+            trio_require_root || exit 1
+            trio_status
+            exit 0
+            ;;
+        dashboard)
+            trio_require_root || exit 1
+            trio_run_with_banner trio_dashboard
+            exit 0
+            ;;
+        connect)
+            trio_require_root || exit 1
+            trio_run_with_banner trio_connect_all
+            exit 0
+            ;;
+        disconnect)
+            trio_require_root || exit 1
+            trio_run_with_banner trio_disconnect_all
+            exit 0
+            ;;
+    esac
+
+    # Sin acción directa: menú interactivo (requiere root salvo en --dry-run).
+    trio_require_root || exit 1
+    trio_menu_loop
+}
+
 main "$@"
+
+# EOF

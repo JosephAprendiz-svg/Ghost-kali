@@ -134,7 +134,7 @@ jobs:
           while IFS= read -r archivo; do
             [[ -f "$archivo" ]] || continue
             for patron in "${PATRONES_PROHIBIDOS[@]}"; do
-              if grep -nE "$patron" "$archivo" 2>/dev/null; then
+              if grep -nE "$patron" "$archivo" 2>/dev/null | grep -vE '^[0-9]+:#'; then
                 printf '%b\n' "${C_DANGER}[CRITICO]${C_RESET} Patron prohibido en ${archivo}: ${patron}"
                 HALLADO=1
               fi

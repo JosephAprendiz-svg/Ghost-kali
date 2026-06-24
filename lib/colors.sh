@@ -308,4 +308,3 @@ ghost_strip_ansi() {
 # ──────────────────────────────────────────────────────────────────────────────
 GHOST_COLOR_MODE=$(_detect_color_mode)
 apply_theme "${GHOST_THEME:-ghost}" || true
-

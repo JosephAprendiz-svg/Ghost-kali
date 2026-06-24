@@ -49,13 +49,13 @@ readonly _LVL_ERROR=50
 readonly _LVL_FATAL=60
 
 # ── Estado configurable ───────────────────────────────────────────────────────
-GHOST_LOG_LEVEL=${GHOST_LOG_LEVEL:-$_LVL_INFO} # umbral mínimo a emitir
-GHOST_LOG_APP=${GHOST_LOG_APP:-joseph-trio}    # etiqueta de componente en archivo
-GHOST_LOG_FILE=${GHOST_LOG_FILE:-}             # ruta del archivo de log
-GHOST_LOG_ENABLED=${GHOST_LOG_ENABLED:-0}      # 1 = escribir a archivo
-GHOST_LOG_JSON=${GHOST_LOG_JSON:-0}            # 1 = formato JSON lines
+GHOST_LOG_LEVEL=${GHOST_LOG_LEVEL:-$_LVL_INFO}                   # umbral mínimo a emitir
+GHOST_LOG_APP=${GHOST_LOG_APP:-joseph-trio}                      # etiqueta de componente en archivo
+GHOST_LOG_FILE=${GHOST_LOG_FILE:-}                               # ruta del archivo de log
+GHOST_LOG_ENABLED=${GHOST_LOG_ENABLED:-0}                        # 1 = escribir a archivo
+GHOST_LOG_JSON=${GHOST_LOG_JSON:-0}                              # 1 = formato JSON lines
 GHOST_LOG_MAX_BYTES=${GHOST_LOG_MAX_BYTES:-$((5 * 1024 * 1024))} # 5 MB
-GHOST_LOG_KEEP=${GHOST_LOG_KEEP:-5}            # nº de copias rotadas
+GHOST_LOG_KEEP=${GHOST_LOG_KEEP:-5}                              # nº de copias rotadas
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  HELPERS INTERNOS

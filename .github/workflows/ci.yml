@@ -1,0 +1,371 @@
+# ---------------------------------------------------------------------------
+# GHOST-KALI v5.0 - .github/workflows/ci.yml
+# Pipeline de Integracion Continua
+#
+# Valida calidad, formato, seguridad y estructura del repositorio en cada
+# push y pull request. Cuatro jobs independientes en paralelo; si alguno
+# falla, el pipeline completo falla.
+#
+# Notas de implementacion:
+#   - Las variables de color (C_*) se definen al inicio de cada step que las
+#     usa, porque bajo 'set -u' una variable no definida abortaria el step.
+#   - El grupo de 'find' usa \( ... \) para agrupar los -name correctamente.
+# ---------------------------------------------------------------------------
+
+name: Ghost-Kali CI
+
+on:
+  push:
+    branches: [main, master, 'feat/**']
+    paths:
+      - '**.sh'
+      - 'joseph-trio'
+      - 'install.sh'
+      - 'uninstall.sh'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main, master, 'feat/**']
+    paths:
+      - '**.sh'
+      - 'joseph-trio'
+      - 'install.sh'
+      - 'uninstall.sh'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+
+# Permisos minimos: el pipeline solo necesita leer el contenido del repo.
+permissions:
+  contents: read
+
+# Un solo run activo por rama/PR. Cancela los runs previos en curso.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # JOB 1 - Analisis estatico: shellcheck, shfmt, comandos prohibidos, shebang.
+  # -------------------------------------------------------------------------
+  lint-shell:
+    name: "Analisis Estatico de Codigo"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: "Checkout del repositorio"
+        uses: actions/checkout@v4
+
+      - name: "Instalar shellcheck"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: "Instalar shfmt"
+        run: |
+          set -euo pipefail
+          SHFMT_VERSION="3.8.0"
+          curl -sSL "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64" -o shfmt
+          chmod +x shfmt
+          sudo mv shfmt /usr/local/bin/
+          shfmt --version
+
+      - name: "Shellcheck - Analisis Estatico"
+        run: |
+          set -euo pipefail
+          C_INFO=$'\033[0;36m'; C_SUCCESS=$'\033[0;32m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          ERRORES=0
+          while IFS= read -r archivo; do
+            [[ -f "$archivo" ]] || continue
+            printf '%b\n' "${C_INFO}[SHELLCHECK]${C_RESET} Analizando: $archivo"
+            shellcheck -S error "$archivo" || ERRORES=1
+          done < <(find . -type f \( -name '*.sh' -o -name 'joseph-trio' -o -name 'install.sh' -o -name 'uninstall.sh' \) ! -path './.git/*')
+          if [[ "$ERRORES" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} shellcheck encontro errores. Corrija antes de hacer push."
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} shellcheck: 0 errores."
+
+      - name: "shfmt - Verificacion de Formato (-i 4 -ci)"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          DIFERENCIAS=0
+          while IFS= read -r archivo; do
+            [[ -f "$archivo" ]] || continue
+            salida="$(shfmt -d -i 4 -ci "$archivo" 2>&1 || true)"
+            if [[ -n "$salida" ]]; then
+              printf '%s\n' "$salida"
+              DIFERENCIAS=1
+            fi
+          done < <(find . -type f \( -name '*.sh' -o -name 'joseph-trio' -o -name 'install.sh' -o -name 'uninstall.sh' \) ! -path './.git/*')
+          if [[ "$DIFERENCIAS" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} shfmt encontro diferencias de formato."
+            printf '%s\n' "Ejecute: shfmt -w -i 4 -ci *.sh lib/*.sh joseph-trio install.sh uninstall.sh"
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} shfmt: formato consistente."
+
+      - name: "Auditoria de Seguridad - Comandos Prohibidos"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          # Patrones ERE de comandos destructivos que nunca deben aparecer.
+          PATRONES_PROHIBIDOS=(
+            'rm[[:space:]]+-[a-z]*r[a-z]*f?[[:space:]]+/'
+            'mkfs\.'
+            'dd[[:space:]]+if='
+            'iptables[[:space:]]+-F'
+            'iptables[[:space:]]+-X'
+            'killall[[:space:]]+-9'
+            'pkill[[:space:]]+-9'
+            ':\(\)[[:space:]]*\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:&[[:space:]]*\}[[:space:]]*;[[:space:]]*:'
+            'chmod[[:space:]]+(-R[[:space:]]+)?777'
+            '>[[:space:]]*/dev/sd[a-z]'
+            'eval[[:space:]]+\$'
+            'wget[[:space:]]+.*\|[[:space:]]*(ba)?sh'
+            'curl[[:space:]]+.*\|[[:space:]]*(ba)?sh'
+          )
+          HALLADO=0
+          while IFS= read -r archivo; do
+            [[ -f "$archivo" ]] || continue
+            for patron in "${PATRONES_PROHIBIDOS[@]}"; do
+              if grep -nE "$patron" "$archivo" 2>/dev/null; then
+                printf '%b\n' "${C_DANGER}[CRITICO]${C_RESET} Patron prohibido en ${archivo}: ${patron}"
+                HALLADO=1
+              fi
+            done
+          done < <(find . -type f \( -name '*.sh' -o -name 'joseph-trio' -o -name 'install.sh' -o -name 'uninstall.sh' \) ! -path './.git/*')
+          if [[ "$HALLADO" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} Se detectaron comandos prohibidos."
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} Auditoria de comandos: limpio."
+
+      - name: "Verificacion de Shebang"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_WARNING=$'\033[0;33m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          SIN_SHEBANG=0
+          while IFS= read -r archivo; do
+            [[ -f "$archivo" ]] || continue
+            primera="$(head -n1 "$archivo")"
+            if [[ ! "$primera" =~ ^#! ]]; then
+              printf '%b\n' "${C_WARNING}[WARN]${C_RESET} Sin shebang: $archivo"
+              SIN_SHEBANG=1
+            fi
+          done < <(find . -type f \( -name '*.sh' -o -name 'joseph-trio' -o -name 'install.sh' -o -name 'uninstall.sh' \) ! -path './.git/*')
+          if [[ "$SIN_SHEBANG" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} Archivos sin shebang detectados."
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} Shebangs: todos presentes."
+# -------------------------------------------------------------------------
+  # JOB 2 - Tests unitarios con BATS (deterministas, sin red).
+  # -------------------------------------------------------------------------
+  test-bats:
+    name: "Tests Unitarios - BATS"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: "Checkout del repositorio"
+        uses: actions/checkout@v4
+
+      - name: "Instalar BATS"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats
+
+      - name: "Ejecutar Tests BATS"
+        run: |
+          set -euo pipefail
+          C_INFO=$'\033[0;36m'; C_SUCCESS=$'\033[0;32m'; C_WARNING=$'\033[0;33m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          if [[ ! -d tests ]]; then
+            printf '%b\n' "${C_WARNING}[WARN]${C_RESET} Directorio tests/ no encontrado; nada que ejecutar."
+            exit 0
+          fi
+          mapfile -t BATS_FILES < <(find tests -type f -name '*.bats')
+          if [[ "${#BATS_FILES[@]}" -eq 0 ]]; then
+            printf '%b\n' "${C_WARNING}[WARN]${C_RESET} No se encontraron archivos .bats."
+            exit 0
+          fi
+          FALLOS=0
+          for bats_file in "${BATS_FILES[@]}"; do
+            printf '%b\n' "${C_INFO}[BATS]${C_RESET} Ejecutando: $bats_file"
+            bats "$bats_file" || FALLOS=1
+          done
+          if [[ "$FALLOS" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} Tests BATS fallaron."
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} Tests BATS: todos pasaron."
+
+  # -------------------------------------------------------------------------
+  # JOB 3 - Validacion de estructura, permisos, secretos y binarios.
+  # -------------------------------------------------------------------------
+  validate-structure:
+    name: "Validacion de Estructura del Repositorio"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: "Checkout del repositorio"
+        uses: actions/checkout@v4
+
+      - name: "Verificar Archivos Criticos"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          ARCHIVOS_CRITICOS=(
+            README.md
+            LICENSE
+            .gitignore
+            lib/vpnctl.sh
+            lib/torctl.sh
+            lib/proxyctl.sh
+            lib/colors.sh
+            lib/logger.sh
+            lib/validators.sh
+            lib/netutils.sh
+            lib/banner.sh
+            lib/dashboard.sh
+            install.sh
+            uninstall.sh
+            joseph-trio
+            config/proxychains4.conf.example
+          )
+          FALTANTES=0
+          for archivo in "${ARCHIVOS_CRITICOS[@]}"; do
+            if [[ ! -f "$archivo" ]]; then
+              printf '%b\n' "${C_DANGER}[FALTANTE]${C_RESET} $archivo"
+              FALTANTES=1
+            else
+              printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} $archivo"
+            fi
+          done
+          if [[ "$FALTANTES" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} Faltan archivos criticos."
+            exit 1
+          fi
+
+      - name: "Verificar Permisos en lib/ (755)"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_WARNING=$'\033[0;33m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          INCORRECTOS=0
+          for archivo in lib/*.sh; do
+            [[ -f "$archivo" ]] || continue
+            perms="$(stat -c '%a' "$archivo")"
+            if [[ "$perms" != "755" ]]; then
+              printf '%b\n' "${C_WARNING}[PERMISOS]${C_RESET} $archivo: $perms (deberia ser 755)"
+              INCORRECTOS=1
+            fi
+          done
+          if [[ "$INCORRECTOS" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[FALLO]${C_RESET} Corrija permisos: chmod 755 lib/*.sh"
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} Permisos: correctos."
+
+      - name: "Deteccion de Credenciales Expuestas"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_DANGER=$'\033[0;31m'; C_RESET=$'\033[0m'
+          PATRONES_SECRETOS=(
+            'password[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+            'passwd[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+            'secret[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+            'token[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+            'api_key[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+            'BEGIN[[:space:]]+(RSA|DSA|EC|OPENSSH)[[:space:]]+PRIVATE[[:space:]]+KEY'
+            'gh[pousr]_[A-Za-z0-9]{36}'
+          )
+          HALLADO=0
+          for patron in "${PATRONES_SECRETOS[@]}"; do
+            if grep -rnE "$patron" . --exclude-dir=.git --exclude='ci.yml' 2>/dev/null; then
+              HALLADO=1
+            fi
+          done
+          if [[ "$HALLADO" -eq 1 ]]; then
+            printf '%b\n' "${C_DANGER}[CRITICO]${C_RESET} Posibles credenciales expuestas en el repositorio."
+            exit 1
+          fi
+          printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} Sin credenciales expuestas."
+
+      - name: "Deteccion de Binarios Sospechosos"
+        run: |
+          set -euo pipefail
+          C_SUCCESS=$'\033[0;32m'; C_WARNING=$'\033[0;33m'; C_RESET=$'\033[0m'
+          BINARIOS="$(find . -type f ! -path './.git/*' -exec file {} \; | grep -E 'ELF|PE32|Mach-O' | cut -d: -f1 || true)"
+          if [[ -n "$BINARIOS" ]]; then
+            printf '%b\n' "${C_WARNING}[WARN]${C_RESET} Archivos binarios detectados (verifique que sean legitimos):"
+            printf '%s\n' "$BINARIOS"
+          else
+            printf '%b\n' "${C_SUCCESS}[OK]${C_RESET} Sin binarios sospechosos."
+          fi
+
+# -------------------------------------------------------------------------
+  # JOB 4 - Compatibilidad en contenedor Kali Linux (shellcheck + shfmt).
+  # -------------------------------------------------------------------------
+  kali-compat:
+    name: "Compatibilidad Kali Linux"
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    container:
+      image: kalilinux/kali-rolling
+      options: --user root
+
+    steps:
+      - name: "Checkout del repositorio"
+        uses: actions/checkout@v4
+
+      - name: "Instalar Dependencias en Kali"
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq shellcheck curl git ca-certificates file findutils
+
+      - name: "Instalar shfmt en Kali"
+        run: |
+          set -euo pipefail
+          SHFMT_VERSION="3.8.0"
+          curl -sSL "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64" -o shfmt
+          chmod +x shfmt
+          mv shfmt /usr/local/bin/
+          shfmt --version
+
+      - name: "Shellcheck en Kali"
+        run: |
+          set -euo pipefail
+          ERRORES=0
+          while IFS= read -r archivo; do
+            [[ -f "$archivo" ]] || continue
+            printf '[SHELLCHECK-KALI] Analizando: %s\n' "$archivo"
+            shellcheck -S error "$archivo" || ERRORES=1
+          done < <(find . -type f \( -name '*.sh' -o -name 'joseph-trio' -o -name 'install.sh' -o -name 'uninstall.sh' \) ! -path './.git/*')
+          if [[ "$ERRORES" -eq 1 ]]; then
+            printf '[FALLO] shellcheck en Kali encontro errores.\n'
+            exit 1
+          fi
+          printf '[OK] shellcheck en Kali: 0 errores.\n'
+
+      - name: "shfmt en Kali"
+        run: |
+          set -euo pipefail
+          DIFERENCIAS=0
+          while IFS= read -r archivo; do
+            [[ -f "$archivo" ]] || continue
+            salida="$(shfmt -d -i 4 -ci "$archivo" 2>&1 || true)"
+            if [[ -n "$salida" ]]; then
+              printf '%s\n' "$salida"
+              DIFERENCIAS=1
+            fi
+          done < <(find . -type f \( -name '*.sh' -o -name 'joseph-trio' -o -name 'install.sh' -o -name 'uninstall.sh' \) ! -path './.git/*')
+          if [[ "$DIFERENCIAS" -eq 1 ]]; then
+            printf '[FALLO] shfmt en Kali encontro diferencias.\n'
+            exit 1
+          fi
+          printf '[OK] shfmt en Kali: formato consistente.\n'

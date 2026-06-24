@@ -51,6 +51,9 @@ jobs:
     name: "Analisis Estatico de Codigo"
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: "Checkout del repositorio"
@@ -168,6 +171,9 @@ jobs:
     name: "Tests Unitarios - BATS"
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: "Checkout del repositorio"
@@ -210,6 +216,9 @@ jobs:
     name: "Validacion de Estructura del Repositorio"
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: "Checkout del repositorio"
@@ -314,6 +323,9 @@ jobs:
     name: "Compatibilidad Kali Linux"
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    defaults:
+      run:
+        shell: bash
     container:
       image: kalilinux/kali-rolling
       options: --user root

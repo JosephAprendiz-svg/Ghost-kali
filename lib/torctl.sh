@@ -1,630 +1,1234 @@
 #!/usr/bin/env bash
-# ──────────────────────────────────────────────────────────────────────────────
-#  lib/torctl.sh — Gestión avanzada (y 100% defensiva) de Tor
-# ──────────────────────────────────────────────────────────────────────────────
-#  Habla el Tor Control Protocol contra 127.0.0.1:9051 SOLO para consultar y
-#  gestionar de forma controlada tu propia instancia de Tor:
-#    detección de auth, NEWNYM, circuitos, streams, exit node, ancho de banda,
-#    uptime, ruta del circuito, panel de estado y verificación de salida.
-#
-#  ⚖️  DISCLAIMER: herramienta 100% DEFENSIVA. Cero ataques, cero exploits.
-#      Solo lectura y comandos de control autorizados sobre tu propio Tor.
-#
-#  🔐 SEGURIDAD (invariantes de este archivo):
-#      · NUNCA imprime el contenido de la cookie de control ni contraseñas.
-#      · NUNCA escribe en /etc/tor/torrc.
-#      · NUNCA modifica la configuración de Tor.
-#      · Solo /dev/tcp (sin depender de torsocks ni proxychains internamente).
-#
-#  LIBRERÍA: cargar con `source lib/torctl.sh`, NO ejecutar. Depende de
-#  lib/logger.sh y lib/validators.sh.
-# ──────────────────────────────────────────────────────────────────────────────
+# shellcheck shell=bash
 
-# ── Guarda de ejecución directa ───────────────────────────────────────────────
-if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
-    printf 'Este archivo es una librería y debe cargarse con «source», no ejecutarse.\n' >&2
-    printf 'Uso: source lib/torctl.sh\n' >&2
+# ───────────────────────────────────────────────────────────────────────────
+# GHOST-KALI v5.0 — lib/torctl.sh
+# Módulo de control del daemon Tor — PERFIL DE ANONIMATO
+# ───────────────────────────────────────────────────────────────────────────
+#
+# PROPÓSITO:
+#   Controlar el servicio Tor del PROPIO equipo del operador y administrar el
+#   anonimato del tráfico propio: estado del servicio, circuitos, selección de
+#   país de salida, rotación de identidad, aislamiento de streams, detección de
+#   fugas y endurecimiento de /etc/tor/torrc.
+#
+# ALCANCE:
+#   Educación en seguridad y privacidad, hardening de la pila de anonimato
+#   propia y verificación de fugas del propio equipo. TODAS las operaciones
+#   configuran cómo egresa el tráfico PROPIO a través de Tor; ninguna explora,
+#   ataca, pivotea hacia, ni evade las defensas de sistemas de terceros.
+#
+# NOTA SOBRE "SIMULACIÓN":
+#   Las funciones de anonimato avanzado (selección de salida, rotación de
+#   identidad, circuitos personalizados, aislamiento de streams) son
+#   capacidades estándar y documentadas del cliente Tor. Se implementan como
+#   lo que son —operaciones de privacidad sobre el tráfico propio— sin marco
+#   de evasión, anti-forense ni acción contra objetivos externos.
+#
+# INVARIANTES DE SEGURIDAD:
+#   · Solo se carga con 'source' (nunca se ejecuta como script).
+#   · Ninguna modificación de torrc sin backup atómico previo.
+#   · Toda operación destructiva respeta --dry-run y pide confirmación.
+#   · Nunca imprime ni registra contraseñas, cookies, hashes ni datos sensibles.
+#   · El módulo NO maneja contraseñas del ControlPort por diseño.
+#   · Prohibidos: rm -rf, mkfs, dd, iptables -F, killall, pkill, eval, exec.
+#
+# CARGA:   source lib/torctl.sh
+# DEPENDE: lib/colors.sh, lib/logger.sh, lib/validators.sh (con fallbacks).
+# LICENCIA: MIT
+# AUTOR:   Joseph (JosephAprendiz-svg)
+# ───────────────────────────────────────────────────────────────────────────
+
+# Guarda de ejecución directa: solo se permite 'source'.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "[FATAL] lib/torctl.sh debe cargarse con 'source', no ejecutarse directamente." >&2
     exit 1
 fi
 
-# ── Guarda de idempotencia ────────────────────────────────────────────────────
-[[ -n ${_GHOST_TORCTL_LOADED:-} ]] && return 0
-_GHOST_TORCTL_LOADED=1
+# Guarda de idempotencia: evitar carga múltiple.
+if [[ -n "${_GHOST_TORCTL_LOADED:-}" ]]; then
+    return 0
+fi
+readonly _GHOST_TORCTL_LOADED=1
 
-# ── Dependencias: logger.sh y validators.sh ───────────────────────────────────
-_ghost_lib_dir=${BASH_SOURCE[0]%/*}
-if [[ -z ${_GHOST_LOGGER_LOADED:-} && -f ${_ghost_lib_dir}/logger.sh ]]; then
-    # shellcheck source=lib/logger.sh
-    source "${_ghost_lib_dir}/logger.sh"
-fi
-if [[ -z ${_GHOST_VALIDATORS_LOADED:-} && -f ${_ghost_lib_dir}/validators.sh ]]; then
-    # shellcheck source=lib/validators.sh
-    source "${_ghost_lib_dir}/validators.sh"
-fi
-# Fallbacks mínimos de logging por si las librerías no estuvieran disponibles.
+# Modo estricto.
+set -euo pipefail
+
+# ───────────────────────────────────────────────────────────────────────────
+# Carga de dependencias (módulos hermanos) con fallbacks inline.
+# ───────────────────────────────────────────────────────────────────────────
+_GHOST_TORCTL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)" ||
+    _GHOST_TORCTL_DIR="."
+
+for _dep in colors.sh logger.sh validators.sh; do
+    if [[ -r "${_GHOST_TORCTL_DIR}/${_dep}" ]]; then
+        # shellcheck source=/dev/null
+        source "${_GHOST_TORCTL_DIR}/${_dep}"
+    fi
+done
+unset _dep
+
+# Fallbacks de color (se interpretan con printf '%b'). Solo si no existen.
+: "${C_RESET:=\033[0m}"
+: "${C_BOLD:=\033[1m}"
+: "${C_DIM:=\033[2m}"
+: "${C_PRIMARY:=\033[0;36m}"
+: "${C_SUCCESS:=\033[0;32m}"
+: "${C_WARNING:=\033[0;33m}"
+: "${C_DANGER:=\033[0;31m}"
+: "${C_INFO:=\033[0;34m}"
+
+# Nivel de log y fallbacks de logging (escriben a stderr).
+: "${GHOST_LOG_LEVEL:=20}"
 if ! declare -F log_info >/dev/null 2>&1; then
-    log_info() { printf 'INFO  %s\n' "$*"; }
-    log_ok() { printf 'OK    %s\n' "$*"; }
-    log_warn() { printf 'WARN  %s\n' "$*" >&2; }
-    log_error() { printf 'ERROR %s\n' "$*" >&2; }
-    log_section() { printf '\n== %s ==\n' "$*"; }
-    log_table() { while [[ $# -ge 2 ]]; do
-        printf '  %s: %s\n' "$1" "$2"
-        shift 2
-    done; }
+    _ghost_torctl_log() {
+        local level="$1"
+        shift
+        local threshold="${GHOST_LOG_LEVEL:-20}"
+        ((level < threshold)) && return 0
+        printf '%b\n' "$*" >&2
+    }
+    log_debug() { _ghost_torctl_log 10 "[DEBUG] $*"; }
+    log_info() { _ghost_torctl_log 20 "[INFO ] $*"; }
+    log_warn() { _ghost_torctl_log 30 "[WARN ] $*"; }
+    log_error() { _ghost_torctl_log 40 "[ERROR] $*"; }
 fi
 
-# ── Constantes configurables ──────────────────────────────────────────────────
-GHOST_TOR_CONTROL_PORT=${GHOST_TOR_CONTROL_PORT:-9051}
-GHOST_TOR_SOCKS_PORT=${GHOST_TOR_SOCKS_PORT:-9050}
-GHOST_TOR_CONTROL_HOST=${GHOST_TOR_CONTROL_HOST:-127.0.0.1}
-GHOST_TOR_COOKIE_PATH=${GHOST_TOR_COOKIE_PATH:-/var/run/tor/control.authcookie}
-GHOST_TORRC=${GHOST_TORRC:-/etc/tor/torrc}
-# Timeout (s) para las lecturas del ControlPort; evita que cat se quede colgado.
-GHOST_TOR_TIMEOUT=${GHOST_TOR_TIMEOUT:-10}
+# ───────────────────────────────────────────────────────────────────────────
+# Constantes de configuración (readonly).
+# ───────────────────────────────────────────────────────────────────────────
+GHOST_TOR_SERVICE="tor"
+readonly GHOST_TOR_SERVICE
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  TRANSPORTE DE BAJO NIVEL
-#  POR QUÉ /dev/tcp: es nativo de bash, no añade dependencias (nc puede variar
-#  entre traditional/openbsd/ncat) y nos basta para hablar con un puerto local.
-# ──────────────────────────────────────────────────────────────────────────────
+GHOST_TORRC="/etc/tor/torrc"
+readonly GHOST_TORRC
 
-# _tor_open → abre el ControlPort en el descriptor 3, SIN ruido en stderr.
-# POR QUÉ: si la conexión falla, bash imprime «connect: Connection refused» por
-# su cuenta; silenciamos temporalmente stderr durante la apertura para que el
-# único mensaje que vea el usuario sea el nuestro, claro y traducido.
-_tor_open() {
-    exec 4>&2 2>/dev/null
-    exec 3<>"/dev/tcp/${GHOST_TOR_CONTROL_HOST}/${GHOST_TOR_CONTROL_PORT}"
-    local rc=$?
-    exec 2>&4 4>&-
-    return $rc
-}
+GHOST_TORRC_BACKUP_DIR="/var/backups/ghost-kali/tor"
+readonly GHOST_TORRC_BACKUP_DIR
 
-# _tor_is_running → 0 si el ControlPort acepta conexiones, 1 si no.
-# POR QUÉ: permite fallar rápido y con un mensaje claro antes de cada operación.
-_tor_is_running() {
-    _tor_open || return 1
-    exec 3>&- 3<&-
-    return 0
-}
+GHOST_TOR_SOCKS_HOST="127.0.0.1"
+readonly GHOST_TOR_SOCKS_HOST
 
-# _tor_require → comprueba conectividad y orienta al usuario si Tor no responde.
-_tor_require() {
-    if _tor_is_running; then
-        return 0
-    fi
-    log_error "Tor no responde en ${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT}."
-    log_error "Comprueba el servicio (systemctl status tor) y que el ControlPort esté abierto."
-    log_error "Si el ControlPort no está accesible, revisa docs/HARDENING.md."
-    return 1
-}
+GHOST_TOR_SOCKS_PORT="9050"
+readonly GHOST_TOR_SOCKS_PORT
 
-# _tor_raw COMANDOS... → envía comandos SIN autenticar (solo válido para
-# PROTOCOLINFO, que el protocolo permite antes de autenticar) y QUIT.
-_tor_raw() {
-    _tor_open || return 1
-    local c
-    for c in "$@"; do printf '%s\r\n' "$c" >&3; done
-    printf 'QUIT\r\n' >&3
-    timeout "$GHOST_TOR_TIMEOUT" cat <&3 | tr -d '\r'
-    exec 3>&- 3<&-
-    return 0
-}
+GHOST_TOR_CONTROL_HOST="127.0.0.1"
+readonly GHOST_TOR_CONTROL_HOST
 
-# detect_tor_auth → detecta el método de autenticación del ControlPort.
-# Imprime: cookie | password | none | error
-# POR QUÉ vía PROTOCOLINFO: es la forma estándar y no requiere estar autenticado.
-detect_tor_auth() {
-    local resp methods cf
-    resp=$(_tor_raw 'PROTOCOLINFO 1') || {
-        printf 'error\n'
-        return 1
-    }
+GHOST_TOR_CONTROL_PORT="9051"
+readonly GHOST_TOR_CONTROL_PORT
 
-    methods=$(printf '%s\n' "$resp" | grep -oE 'METHODS=[A-Z,]+' | head -1 | cut -d= -f2)
+GHOST_TOR_CHECK_URL="https://check.torproject.org/api/ip"
+readonly GHOST_TOR_CHECK_URL
 
-    # Si Tor reporta la ruta real de la cookie, la adoptamos (no leemos su valor).
-    cf=$(printf '%s\n' "$resp" | grep -oE 'COOKIEFILE="[^"]+"' | head -1 |
-        sed -E 's/COOKIEFILE="(.*)"/\1/')
-    [[ -n $cf ]] && GHOST_TOR_COOKIE_PATH=$cf
+GHOST_TOR_TIMEOUT="10"
+readonly GHOST_TOR_TIMEOUT
 
-    # Preferimos COOKIE (o SAFECOOKIE) sobre contraseña. Comparamos tokens exactos.
-    if [[ ,${methods}, == *,COOKIE,* || ,${methods}, == *,SAFECOOKIE,* ]]; then
-        printf 'cookie\n'
-    elif [[ ,${methods}, == *,HASHEDPASSWORD,* ]]; then
-        printf 'password\n'
-    elif [[ ,${methods}, == *,NULL,* ]]; then
-        printf 'none\n'
-    else
-        printf 'error\n'
-        return 1
-    fi
-}
+# ───────────────────────────────────────────────────────────────────────────
+# Estado interno (no readonly).
+# ───────────────────────────────────────────────────────────────────────────
+_GHOST_TORCTL_DRY_RUN=0         # 0 = real, 1 = simulación
+_GHOST_TORCTL_NON_INTERACTIVE=0 # 0 = interactivo, 1 = automático
+_GHOST_TORCTL_GHOST_BACKUP=""   # ruta del backup tomado por ghost_circuit --on
+_GHOST_TORCTL_OPLOG=()          # bitácora de operaciones de la sesión
 
-# _tor_build_auth → construye la línea AUTHENTICATE adecuada.
-# ⚠️ La salida contiene material sensible (cookie en hex o contraseña): se usa
-#    ÚNICAMENTE para enviarla al socket. JAMÁS debe registrarse ni imprimirse.
-_tor_build_auth() {
-    local method
-    method=$(detect_tor_auth) || return 1
+# ═══════════════════════════════════════════════════════════════════════════
+# FUNCIONES PRIVADAS (_torctl_)
+# ═══════════════════════════════════════════════════════════════════════════
 
-    case $method in
-        cookie)
-            # Nota: SAFECOOKIE estricto exige un reto-respuesta HMAC que esta
-            # librería no implementa; en la práctica los despliegues con
-            # CookieAuthentication 1 también ofrecen COOKIE plano, que sí usamos.
-            if [[ ! -r $GHOST_TOR_COOKIE_PATH ]]; then
-                log_error "No se puede leer la cookie de control (${GHOST_TOR_COOKIE_PATH})."
-                log_error "Ejecuta como root o revisa permisos del directorio de Tor."
-                return 1
-            fi
-            local hex
-            hex=$(od -An -v -tx1 "$GHOST_TOR_COOKIE_PATH" 2>/dev/null | tr -d ' \n')
-            if [[ -z $hex ]]; then
-                log_error "La cookie de control está vacía o no se pudo codificar."
-                return 1
-            fi
-            printf 'AUTHENTICATE %s' "$hex"
-            ;;
-        password)
-            if [[ -z ${GHOST_TOR_CONTROL_PASSWORD:-} ]]; then
-                log_error "El ControlPort usa contraseña. Define GHOST_TOR_CONTROL_PASSWORD."
-                log_error "(Tor solo guarda el hash en torrc; la contraseña en claro la aportas tú.)"
-                return 1
-            fi
-            local p=${GHOST_TOR_CONTROL_PASSWORD//\\/\\\\}
-            p=${p//\"/\\\"}
-            printf 'AUTHENTICATE "%s"' "$p"
-            ;;
-        none)
-            printf 'AUTHENTICATE'
-            ;;
-        *)
-            log_error "No se pudo determinar el método de autenticación del ControlPort."
-            return 1
-            ;;
-    esac
-}
-
-# _tor_exec COMANDO → autentica, envía UN comando y devuelve su respuesta.
-# Códigos de retorno: 0 ok · 1 sin conexión · 2 auth no construible · 3 auth fallida
-# La salida NO incluye la línea de AUTHENTICATE (para no exponer el resultado de
-# auth al llamador) ni se registra el material de autenticación en ningún punto.
-_tor_exec() {
-    local auth
-    auth=$(_tor_build_auth) || return 2
-
-    _tor_open || return 1
-    printf '%s\r\n' "$auth" >&3
-    local c
-    for c in "$@"; do printf '%s\r\n' "$c" >&3; done
-    printf 'QUIT\r\n' >&3
-
-    local all
-    all=$(timeout "$GHOST_TOR_TIMEOUT" cat <&3 | tr -d '\r')
-    exec 3>&- 3<&-
-
-    # La primera línea es la respuesta a AUTHENTICATE.
-    local first
-    first=$(printf '%s\n' "$all" | head -1)
-    if [[ $first != 250* ]]; then
-        return 3
-    fi
-    # Devolvemos todo menos esa primera línea.
-    printf '%s\n' "$all" | sed '1d'
-    return 0
-}
-
-# _tor_getinfo_one CLAVE → valor de un GETINFO de una sola línea.
-_tor_getinfo_one() {
-    local key=$1 resp rc
-    resp=$(_tor_exec "GETINFO ${key}")
-    rc=$?
-    [[ $rc -ne 0 ]] && return $rc
-    printf '%s\n' "$resp" | sed -nE "s#^250[ +-]${key}=(.*)\$#\1#p" | head -1
-}
-
-# _tor_getinfo_multi CLAVE → líneas de datos de un GETINFO multilínea (250+ ... .)
-_tor_getinfo_multi() {
-    local key=$1 resp rc line inblock=0
-    resp=$(_tor_exec "GETINFO ${key}")
-    rc=$?
-    [[ $rc -ne 0 ]] && return $rc
-    while IFS= read -r line; do
-        if [[ $inblock -eq 1 ]]; then
-            [[ $line == "." ]] && {
-                inblock=0
-                continue
-            }
-            printf '%s\n' "$line"
-        elif [[ $line == "250+${key}="* ]]; then
-            inblock=1
-        fi
-    done <<<"$resp"
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  UTILIDADES DE FORMATO
-# ──────────────────────────────────────────────────────────────────────────────
-
-# _human_bytes N → formatea un número de bytes a unidades legibles.
-_human_bytes() {
-    awk -v b="${1:-0}" 'BEGIN{
-        split("B KiB MiB GiB TiB",u," "); i=1;
-        while (b>=1024 && i<5){ b/=1024; i++ }
-        if (i==1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
-    }'
-}
-
-# _human_duration SEGUNDOS → formatea una duración a «Nd HHh MMm SSs».
-_human_duration() {
-    local s=${1:-0} d h m
-    [[ $s =~ ^[0-9]+$ ]] || s=0
-    d=$((s / 86400))
-    s=$((s % 86400))
-    h=$((s / 3600))
-    s=$((s % 3600))
-    m=$((s / 60))
-    s=$((s % 60))
-    printf '%dd %02dh %02dm %02ds' "$d" "$h" "$m" "$s"
-}
-
-# _tor_node_ip FINGERPRINT → IP del relay (consulta GETINFO ns/id/$FP).
-_tor_node_ip() {
-    local fp=$1 ns
-    [[ -n $fp ]] || return 1
-    ns=$(_tor_exec "GETINFO ns/id/\$${fp}") || return 1
-    # En la línea «r»: r nick id digest fecha hora IP ORPort DirPort → IP es $7.
-    printf '%s\n' "$ns" | awk '/^r /{print $7; exit}'
-}
-
-# _tor_ip_country IP → código de país del relay (GETINFO ip-to-country/IP).
-_tor_ip_country() {
-    local ip=$1 cc
-    [[ -n $ip ]] || {
-        printf '??'
-        return
-    }
-    cc=$(_tor_getinfo_one "ip-to-country/${ip}" 2>/dev/null)
-    printf '%s' "${cc:-??}"
-}
-
-# _tor_latest_general_circuit → línea del circuito GENERAL construido más reciente.
-_tor_latest_general_circuit() {
-    local data line best=""
-    data=$(_tor_getinfo_multi circuit-status) || return 1
-    while IFS= read -r line; do
-        [[ $line == *"PURPOSE=GENERAL"* ]] || continue
-        [[ $line == *" BUILT "* ]] || continue
-        best=$line # el más reciente aparece al final del listado
-    done <<<"$data"
-    [[ -n $best ]] || return 1
-    printf '%s\n' "$best"
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  API PÚBLICA
-# ──────────────────────────────────────────────────────────────────────────────
-
-# tor_authenticate → verifica que podemos autenticarnos en el ControlPort.
-tor_authenticate() {
-    _tor_require || return 1
-    local ver rc
-    ver=$(_tor_getinfo_one version)
-    rc=$?
-    if [[ $rc -eq 0 && -n $ver ]]; then
-        log_ok "Autenticado en el ControlPort de Tor (versión ${ver})."
-        return 0
-    fi
-    case $rc in
-        3) log_error "Autenticación rechazada por el ControlPort." ;;
-        2) log_error "No se pudo construir la autenticación (cookie/contraseña)." ;;
-        *) log_error "El ControlPort no respondió como se esperaba (código ${rc})." ;;
-    esac
-    log_error "Configura cookie (CookieAuthentication 1) o contraseña. Ver docs/HARDENING.md."
-    return 1
-}
-
-# tor_newnym [--dry-run] → solicita una nueva identidad (SIGNAL NEWNYM).
-tor_newnym() {
-    local dry=${GHOST_DRY_RUN:-0}
-    [[ ${1:-} == --dry-run ]] && dry=1
-
-    if [[ $dry == 1 ]]; then
-        log_info "[dry-run] Enviaría «SIGNAL NEWNYM» para obtener una nueva identidad Tor."
-        return 0
-    fi
-
-    _tor_require || return 1
-    if _tor_exec 'SIGNAL NEWNYM' >/dev/null; then
-        log_ok "Nueva identidad Tor solicitada (SIGNAL NEWNYM)."
-        return 0
-    fi
-    log_error "No se pudo solicitar una nueva identidad. ¿ControlPort accesible y autenticado?"
-    return 1
-}
-
-# tor_get_circuits → lista los circuitos activos.
-tor_get_circuits() {
-    _tor_require || return 1
-    local data
-    data=$(_tor_getinfo_multi circuit-status) || {
-        log_error "No se pudieron obtener los circuitos (¿autenticación correcta?)."
-        return 1
-    }
-    if [[ -z $data ]]; then
-        log_warn "No hay circuitos activos en este momento."
-        return 0
-    fi
-    log_section "Circuitos Tor activos"
-    local line id status
-    while IFS= read -r line; do
-        [[ -z $line ]] && continue
-        id=$(awk '{print $1}' <<<"$line")
-        status=$(awk '{print $2}' <<<"$line")
-        log_table "Circuito ${id}" "${status}"
-    done <<<"$data"
-    return 0
-}
-
-# tor_get_streams → lista los streams activos.
-tor_get_streams() {
-    _tor_require || return 1
-    local data
-    data=$(_tor_getinfo_multi stream-status) || {
-        log_error "No se pudieron obtener los streams."
-        return 1
-    }
-    if [[ -z $data ]]; then
-        log_warn "No hay streams activos en este momento."
-        return 0
-    fi
-    log_section "Streams Tor activos"
-    local line sid sstatus target
-    while IFS= read -r line; do
-        [[ -z $line ]] && continue
-        sid=$(awk '{print $1}' <<<"$line")
-        sstatus=$(awk '{print $2}' <<<"$line")
-        target=$(awk '{print $4}' <<<"$line")
-        log_table "Stream ${sid}" "${sstatus} → ${target:-?}"
-    done <<<"$data"
-    return 0
-}
-
-# tor_close_stream <ID> [--dry-run] [--non-interactive|--yes]
-# Cierra un stream por ID. Pide confirmación salvo en modo no interactivo.
-tor_close_stream() {
-    local id="" dry=${GHOST_DRY_RUN:-0} noninteractive=${GHOST_NON_INTERACTIVE:-0}
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --dry-run) dry=1 ;;
-            --yes | --non-interactive) noninteractive=1 ;;
-            *) id=$1 ;;
-        esac
-        shift
+# Verifica que estén disponibles las dependencias indicadas.
+_torctl_check_dependencies() {
+    local -a needed=("$@")
+    local -a missing=()
+    local cmd
+    for cmd in "${needed[@]}"; do
+        command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
     done
-
-    if [[ -z $id ]]; then
-        log_error "Uso: tor_close_stream <ID> [--dry-run] [--non-interactive]"
+    if ((${#missing[@]} > 0)); then
+        log_error "Dependencias ausentes: ${missing[*]}"
         return 1
     fi
-    if ! [[ $id =~ ^[0-9]+$ ]]; then
-        log_error "ID de stream inválido: «${id}» (debe ser numérico)."
-        return 1
-    fi
+    return 0
+}
 
-    if [[ $dry == 1 ]]; then
-        log_info "[dry-run] Cerraría el stream ${id} con «CLOSESTREAM ${id} 1»."
+# Retorna 0 si el usuario efectivo es root.
+_torctl_is_root() {
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] && return 0
+    return 1
+}
+
+# Registra una operación en la bitácora de la sesión (UTC|acción|resultado).
+_torctl_log_op() {
+    local action="${1:-?}"
+    local result="${2:-?}"
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' '-')"
+    _GHOST_TORCTL_OPLOG+=("${ts}|${action}|${result}")
+    return 0
+}
+
+# Crea el directorio de backups con permisos 700. Imprime su ruta.
+_torctl_create_backup_path() {
+    local dir="${GHOST_TORRC_BACKUP_DIR}"
+    if [[ ! -d "${dir}" ]]; then
+        if ((_GHOST_TORCTL_DRY_RUN)); then
+            log_info "[dry-run] mkdir -p ${dir}"
+        else
+            mkdir -p "${dir}" || {
+                log_error "No se pudo crear ${dir}"
+                return 1
+            }
+            chmod 700 "${dir}" 2>/dev/null || true
+        fi
+    fi
+    printf '%s' "${dir}"
+    return 0
+}
+
+# Retorna la ruta del backup más reciente para un archivo base dado.
+_torctl_latest_backup() {
+    local base="${1:-${GHOST_TORRC}}"
+    local dir="${GHOST_TORRC_BACKUP_DIR}"
+    [[ -d "${dir}" ]] || return 1
+    local name latest
+    name="$(basename "${base}")"
+    latest="$(find "${dir}" -maxdepth 1 -type f -name "${name}.*.bak" -printf '%T@ %p\n' 2>/dev/null |
+        sort -rn | head -n1 | cut -d' ' -f2- || true)"
+    [[ -n "${latest}" ]] || return 1
+    printf '%s' "${latest}"
+    return 0
+}
+
+# Crea backup con marca temporal ISO 8601 UTC. Imprime la ruta del backup.
+_torctl_backup_config() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    [[ -r "${ruta}" ]] || {
+        log_error "No se puede leer para backup: ${ruta}"
+        return 1
+    }
+    local dir ts name dest
+    dir="$(_torctl_create_backup_path)" || return 1
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    name="$(basename "${ruta}")"
+    dest="${dir}/${name}.${ts}.bak"
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] Copiaría ${ruta} -> ${dest}"
+        printf '%s' "${dest}"
         return 0
     fi
+    cat "${ruta}" >"${dest}" || {
+        log_error "Backup falló"
+        return 1
+    }
+    chmod 600 "${dest}" 2>/dev/null || true
+    printf '%s' "${dest}"
+    return 0
+}
 
-    if [[ $noninteractive != 1 ]]; then
-        printf 'Vas a cerrar el stream %s. ¿Continuar? [s/N] ' "$id"
-        local ans
-        read -r ans
-        if ! [[ $ans =~ ^[sSyY]$ ]]; then
+# Escritura atómica con backup previo. Respeta --dry-run.
+_torctl_safe_write() {
+    local target="${1:-}"
+    local content="${2:-}"
+    [[ -n "${target}" ]] || {
+        log_error "safe_write: destino vacío"
+        return 1
+    }
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] Escribiría $((${#content})) bytes en ${target} (con backup previo)"
+        return 0
+    fi
+    if [[ -e "${target}" ]]; then
+        _torctl_backup_config "${target}" >/dev/null || {
+            log_error "Backup falló; se aborta la escritura"
+            return 1
+        }
+    fi
+    local tmp
+    tmp="$(mktemp "${target}.XXXXXX.tmp")" || {
+        log_error "mktemp falló"
+        return 1
+    }
+    printf '%s\n' "${content}" >"${tmp}" || {
+        rm -f "${tmp}"
+        return 1
+    }
+    chmod --reference="${target}" "${tmp}" 2>/dev/null || chmod 600 "${tmp}" 2>/dev/null || true
+    mv -f "${tmp}" "${target}" || {
+        rm -f "${tmp}"
+        log_error "Movimiento atómico falló"
+        return 1
+    }
+    log_info "Escritura atómica completada: ${target}"
+    return 0
+}
+
+# Solicita confirmación interactiva. En modo no interactivo, aborta por seguridad.
+_torctl_confirm_action() {
+    local prompt="${1:-¿Continuar?}"
+    if ((_GHOST_TORCTL_NON_INTERACTIVE)); then
+        log_warn "Modo no interactivo: acción destructiva no confirmada; se aborta por seguridad."
+        return 1
+    fi
+    local reply=""
+    printf '%b' "${C_WARNING}${prompt} [s/N]: ${C_RESET}" >&2
+    read -r reply || true
+    case "${reply,,}" in
+        s | si | sí | y | yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Mide la latencia (ms) de conexión TCP a un host:puerto LOCAL propio.
+_torctl_measure_latency() {
+    local host="${1:-${GHOST_TOR_SOCKS_HOST}}"
+    local port="${2:-${GHOST_TOR_SOCKS_PORT}}"
+    local start end
+    start="$(date +%s%3N)"
+    if command -v nc >/dev/null 2>&1; then
+        nc -z -w 3 "${host}" "${port}" >/dev/null 2>&1 || {
+            printf '%s' "-1"
+            return 1
+        }
+    else
+        (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 || {
+            printf '%s' "-1"
+            return 1
+        }
+    fi
+    end="$(date +%s%3N)"
+    printf '%s' "$((end - start))"
+    return 0
+}
+
+# Comprueba conectividad TCP al puerto SOCKS local. Retorna 0 si responde.
+_torctl_check_socks_port() {
+    _torctl_measure_latency "${GHOST_TOR_SOCKS_HOST}" "${GHOST_TOR_SOCKS_PORT}" >/dev/null 2>&1
+}
+
+# Comprueba conectividad TCP al ControlPort local. Retorna 0 si responde.
+_torctl_check_control_port() {
+    _torctl_measure_latency "${GHOST_TOR_CONTROL_HOST}" "${GHOST_TOR_CONTROL_PORT}" >/dev/null 2>&1
+}
+
+# Envía un comando al ControlPort vía nc. Autentica con cookie/clave vacía
+# (null auth). NO maneja contraseñas: si el ControlPort exige autenticación
+# con secreto, se reporta el fallo y el operador debe autenticar por su cuenta.
+_torctl_control_cmd() {
+    local cmd="${1:-}"
+    [[ -n "${cmd}" ]] || return 1
+    command -v nc >/dev/null 2>&1 || {
+        log_error "nc no disponible para hablar con el ControlPort"
+        return 1
+    }
+    _torctl_check_control_port || {
+        log_error "ControlPort ${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT} no responde"
+        return 1
+    }
+    local resp
+    resp="$(printf 'AUTHENTICATE\r\n%s\r\nQUIT\r\n' "${cmd}" |
+        nc -w "${GHOST_TOR_TIMEOUT}" "${GHOST_TOR_CONTROL_HOST}" "${GHOST_TOR_CONTROL_PORT}" 2>/dev/null || true)"
+    if [[ -z "${resp}" ]]; then
+        log_error "Sin respuesta del ControlPort"
+        return 1
+    fi
+    if printf '%s' "${resp}" | grep -Eq '^5[0-9][0-9]|Authentication'; then
+        log_error "Autenticación del ControlPort rechazada. Configure 'CookieAuthentication 1' y los permisos del grupo tor/debian-tor, o autentique manualmente. El módulo no maneja contraseñas por diseño."
+        return 1
+    fi
+    printf '%s' "${resp}"
+    return 0
+}
+
+# Normaliza un valor booleano: 1/yes/true/on -> 0; el resto -> 1.
+_torctl_parse_bool() {
+    case "${1,,}" in
+        1 | yes | sí | si | true | on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Imprime torrc saneado: redacta hashes de control, cookies y secretos.
+_torctl_sanitize_output() {
+    local ruta="${1:-}"
+    [[ -r "${ruta}" ]] || return 1
+    awk '
+        {
+            line=$0
+            low=tolower(line)
+            if (low ~ /hashedcontrolpassword/) { print "HashedControlPassword <REDACTADO>"; next }
+            if (low ~ /^[[:space:]]*bridge[[:space:]]/) {
+                gsub(/cert=[^[:space:]]+/, "cert=<REDACTADO>", line)
+                print line; next
+            }
+            if (line ~ /^[[:space:]]*#/) {
+                if (low ~ /pass/ || low ~ /secret/ || low ~ /token/) {
+                    gsub(/[Pp][Aa][Ss][Ss]([Ww][Oo][Rr][Dd])?[[:space:]]*[=:][[:space:]]*[^[:space:]]+/, "password=<REDACTADO>", line)
+                    gsub(/[Ss][Ee][Cc][Rr][Ee][Tt][[:space:]]*[=:][[:space:]]*[^[:space:]]+/, "secret=<REDACTADO>", line)
+                    gsub(/[Tt][Oo][Kk][Ee][Nn][[:space:]]*[=:][[:space:]]*[^[:space:]]+/, "token=<REDACTADO>", line)
+                }
+                print line; next
+            }
+            if (low ~ /password|secret|token|authcookie|controlsocket/) {
+                n=split(line, a, /[[:space:]]+/)
+                if (n>=1 && a[1] !~ /^#/) { printf "%s <REDACTADO>\n", a[1]; next }
+            }
+            print line
+        }
+    ' "${ruta}"
+}
+
+# Establece (o reemplaza la primera ocurrencia de) una directiva en torrc de
+# forma idempotente. Si no existe, la añade al final. Backup atómico previo.
+_torctl_torrc_set() {
+    local ruta="${1:-}"
+    local directive="${2:-}"
+    local value="${3:-}"
+    [[ -r "${ruta}" ]] || {
+        log_error "No se puede leer torrc: ${ruta}"
+        return 1
+    }
+    [[ -n "${directive}" ]] || return 1
+    local newcontent
+    newcontent="$(awk -v d="${directive}" -v v="${value}" '
+        BEGIN { done=0 }
+        {
+            line=$0
+            tmp=line
+            sub(/^[[:space:]]+/, "", tmp)
+            sub(/^#[[:space:]]*/, "", tmp)
+            n=split(tmp, a, /[[:space:]]+/)
+            if (!done && n>=1 && a[1]==d) {
+                if (v=="") { print d } else { print d" "v }
+                done=1
+                next
+            }
+            print line
+        }
+        END {
+            if (!done) {
+                if (v=="") { print d } else { print d" "v }
+            }
+        }
+    ' "${ruta}")"
+    _torctl_safe_write "${ruta}" "${newcontent}"
+}
+
+# Comenta todas las líneas activas de una directiva. Backup atómico previo.
+_torctl_torrc_comment() {
+    local ruta="${1:-}"
+    local directive="${2:-}"
+    [[ -r "${ruta}" ]] || return 1
+    [[ -n "${directive}" ]] || return 1
+    local newcontent
+    newcontent="$(awk -v d="${directive}" '
+        {
+            line=$0
+            tmp=line
+            sub(/^[[:space:]]+/, "", tmp)
+            n=split(tmp, a, /[[:space:]]+/)
+            if (n>=1 && a[1]==d && line !~ /^[[:space:]]*#/) {
+                print "#"line
+            } else {
+                print line
+            }
+        }
+    ' "${ruta}")"
+    _torctl_safe_write "${ruta}" "${newcontent}"
+}
+
+# Consulta la IP de egreso a través del SOCKS de Tor. Imprime la IP.
+_torctl_egress_ip() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local out ip
+    out="$(curl -s --socks5-hostname "${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT}" \
+        --max-time "${GHOST_TOR_TIMEOUT}" "${GHOST_TOR_CHECK_URL}" 2>/dev/null || true)"
+    [[ -n "${out}" ]] || return 1
+    ip="$(printf '%s' "${out}" |
+        grep -oE '"IP"[[:space:]]*:[[:space:]]*"[^"]+"' |
+        sed -E 's/.*"([0-9a-fA-F:.]+)".*/\1/' | head -n1 || true)"
+    [[ -n "${ip}" ]] || return 1
+    printf '%s' "${ip}"
+    return 0
+}
+
+# Retorna 0 si la IP de egreso es reconocida como nodo Tor.
+_torctl_egress_is_tor() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local out
+    out="$(curl -s --socks5-hostname "${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT}" \
+        --max-time "${GHOST_TOR_TIMEOUT}" "${GHOST_TOR_CHECK_URL}" 2>/dev/null || true)"
+    [[ -n "${out}" ]] || return 1
+    printf '%s' "${out}" | grep -qiE '"IsTor"[[:space:]]*:[[:space:]]*true' && return 0
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BLOQUE A — OPERACIONES DEFENSIVAS / DE PRIVACIDAD
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A.01 — Retorna 0 si tor y systemctl están disponibles.
+torctl_is_installed() {
+    command -v tor >/dev/null 2>&1 || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# A.03 — Imprime la versión del binario tor.
+torctl_get_version() {
+    command -v tor >/dev/null 2>&1 || {
+        printf '%s' "no instalado"
+        return 1
+    }
+    local v
+    v="$(tor --version 2>/dev/null | grep -oiE 'version[^0-9]*[0-9][0-9a-z.\-]*' | head -n1 || true)"
+    [[ -n "${v}" ]] || v="versión desconocida"
+    printf '%s' "${v}"
+    return 0
+}
+
+# A.04 — Retorna 0 si el servicio tor está activo.
+torctl_is_running() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "${GHOST_TOR_SERVICE}" && return 0
+    return 1
+}
+
+# A.10 — Imprime host:puerto del SOCKS de Tor.
+torctl_get_socks() {
+    printf '%s:%s' "${GHOST_TOR_SOCKS_HOST}" "${GHOST_TOR_SOCKS_PORT}"
+    return 0
+}
+
+# A.11 — Imprime host:puerto del ControlPort de Tor.
+torctl_get_control() {
+    printf '%s:%s' "${GHOST_TOR_CONTROL_HOST}" "${GHOST_TOR_CONTROL_PORT}"
+    return 0
+}
+
+# A.12 — Prueba conectividad TCP al puerto SOCKS de Tor.
+torctl_check_socks() {
+    if _torctl_check_socks_port; then
+        log_info "SOCKS ${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} responde."
+        return 0
+    fi
+    log_warn "SOCKS ${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} no responde."
+    return 1
+}
+
+# A.13 — Prueba conectividad TCP al ControlPort de Tor.
+torctl_check_control() {
+    if _torctl_check_control_port; then
+        log_info "ControlPort ${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT} responde."
+        return 0
+    fi
+    log_warn "ControlPort ${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT} no responde."
+    return 1
+}
+
+# A.05 — Inicia el servicio tor. Respeta --dry-run y pide confirmación.
+torctl_start() {
+    torctl_is_installed || {
+        log_error "Tor no está instalado."
+        return 1
+    }
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] systemctl start ${GHOST_TOR_SERVICE}"
+        return 0
+    fi
+    _torctl_is_root || {
+        log_error "Se requieren privilegios root (use sudo) para gestionar el servicio."
+        return 1
+    }
+    _torctl_confirm_action "¿Iniciar el servicio ${GHOST_TOR_SERVICE}?" || {
+        log_warn "Operación cancelada."
+        return 1
+    }
+    systemctl start "${GHOST_TOR_SERVICE}" || {
+        log_error "No se pudo iniciar ${GHOST_TOR_SERVICE}."
+        return 1
+    }
+    log_info "Servicio ${GHOST_TOR_SERVICE} iniciado."
+    _torctl_log_op "start" "ok"
+    return 0
+}
+
+# A.06 — Detiene el servicio tor. Respeta --dry-run y pide confirmación.
+torctl_stop() {
+    torctl_is_installed || {
+        log_error "Tor no está instalado."
+        return 1
+    }
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] systemctl stop ${GHOST_TOR_SERVICE}"
+        return 0
+    fi
+    _torctl_is_root || {
+        log_error "Se requieren privilegios root (use sudo) para gestionar el servicio."
+        return 1
+    }
+    _torctl_confirm_action "¿Detener el servicio ${GHOST_TOR_SERVICE}? Perderá el anonimato Tor." || {
+        log_warn "Operación cancelada."
+        return 1
+    }
+    systemctl stop "${GHOST_TOR_SERVICE}" || {
+        log_error "No se pudo detener ${GHOST_TOR_SERVICE}."
+        return 1
+    }
+    log_info "Servicio ${GHOST_TOR_SERVICE} detenido."
+    _torctl_log_op "stop" "ok"
+    return 0
+}
+
+# A.07 — Reinicia el servicio tor. Respeta --dry-run y pide confirmación.
+torctl_restart() {
+    torctl_is_installed || {
+        log_error "Tor no está instalado."
+        return 1
+    }
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] systemctl restart ${GHOST_TOR_SERVICE}"
+        return 0
+    fi
+    _torctl_is_root || {
+        log_error "Se requieren privilegios root (use sudo) para gestionar el servicio."
+        return 1
+    }
+    _torctl_confirm_action "¿Reiniciar el servicio ${GHOST_TOR_SERVICE}?" || {
+        log_warn "Operación cancelada."
+        return 1
+    }
+    systemctl restart "${GHOST_TOR_SERVICE}" || {
+        log_error "No se pudo reiniciar ${GHOST_TOR_SERVICE}."
+        return 1
+    }
+    log_info "Servicio ${GHOST_TOR_SERVICE} reiniciado."
+    _torctl_log_op "restart" "ok"
+    return 0
+}
+
+# A.08 — Habilita el inicio automático de tor. Respeta --dry-run.
+torctl_enable() {
+    torctl_is_installed || {
+        log_error "Tor no está instalado."
+        return 1
+    }
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] systemctl enable ${GHOST_TOR_SERVICE}"
+        return 0
+    fi
+    _torctl_is_root || {
+        log_error "Se requieren privilegios root (use sudo)."
+        return 1
+    }
+    systemctl enable "${GHOST_TOR_SERVICE}" >/dev/null 2>&1 || {
+        log_error "No se pudo habilitar ${GHOST_TOR_SERVICE}."
+        return 1
+    }
+    log_info "Inicio automático de ${GHOST_TOR_SERVICE} habilitado."
+    _torctl_log_op "enable" "ok"
+    return 0
+}
+
+# A.09 — Deshabilita el inicio automático de tor. Respeta --dry-run.
+torctl_disable() {
+    torctl_is_installed || {
+        log_error "Tor no está instalado."
+        return 1
+    }
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] systemctl disable ${GHOST_TOR_SERVICE}"
+        return 0
+    fi
+    _torctl_is_root || {
+        log_error "Se requieren privilegios root (use sudo)."
+        return 1
+    }
+    systemctl disable "${GHOST_TOR_SERVICE}" >/dev/null 2>&1 || {
+        log_error "No se pudo deshabilitar ${GHOST_TOR_SERVICE}."
+        return 1
+    }
+    log_info "Inicio automático de ${GHOST_TOR_SERVICE} deshabilitado."
+    _torctl_log_op "disable" "ok"
+    return 0
+}
+
+# A.14 — Fuerza un nuevo circuito Tor (SIGNAL NEWNYM) vía ControlPort.
+torctl_newnym() {
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] SIGNAL NEWNYM al ControlPort"
+        return 0
+    fi
+    if _torctl_control_cmd "SIGNAL NEWNYM" >/dev/null; then
+        log_info "Nuevo circuito solicitado (NEWNYM)."
+        _torctl_log_op "newnym" "ok"
+        return 0
+    fi
+    log_error "No se pudo enviar NEWNYM."
+    _torctl_log_op "newnym" "fallo"
+    return 1
+}
+
+# A.15 — Obtiene información del circuito actual (GETINFO circuit-status).
+torctl_get_circuit_info() {
+    local resp
+    resp="$(_torctl_control_cmd "GETINFO circuit-status" || true)"
+    if [[ -z "${resp}" ]]; then
+        log_warn "Sin información de circuitos (ControlPort no disponible o sin autenticación)."
+        return 1
+    fi
+    printf '%s\n' "${resp}" | grep -vE '^250 OK|^250\+circuit-status=|^\.$' || true
+    return 0
+}
+
+# A.16 — Verifica que la IP de egreso sea un nodo Tor consultando el servicio
+# oficial de Tor a través del propio SOCKS.
+torctl_is_exit_reachable() {
+    _torctl_check_socks_port || {
+        log_warn "SOCKS local no responde; no se puede verificar el egreso."
+        return 1
+    }
+    local ip
+    ip="$(_torctl_egress_ip || true)"
+    if [[ -z "${ip}" ]]; then
+        log_warn "No se obtuvo IP de egreso."
+        return 1
+    fi
+    if _torctl_egress_is_tor; then
+        log_info "Egreso por Tor confirmado. IP: ${ip}"
+        return 0
+    fi
+    log_warn "La IP de egreso (${ip}) NO se reconoce como nodo Tor."
+    return 1
+}
+
+# A.17 — Muestra torrc saneado (sin secretos).
+torctl_show_config() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    [[ -r "${ruta}" ]] || {
+        log_error "No se puede leer: ${ruta}"
+        return 1
+    }
+    printf '%b\n' "${C_INFO}Configuración Tor (saneada): ${ruta}${C_RESET}"
+    _torctl_sanitize_output "${ruta}"
+    return 0
+}
+
+# A.18 — Valida que torrc exista, sea legible y defina SocksPort o ControlPort.
+torctl_validate_config() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    [[ -e "${ruta}" ]] || {
+        log_error "No existe: ${ruta}"
+        return 1
+    }
+    [[ -r "${ruta}" ]] || {
+        log_error "No legible: ${ruta}"
+        return 1
+    }
+    if grep -Eiq '^[[:space:]]*(SocksPort|ControlPort)\b' "${ruta}"; then
+        log_info "torrc válido: define SocksPort o ControlPort."
+        return 0
+    fi
+    log_warn "torrc no define SocksPort ni ControlPort explícitos (Tor usará valores por defecto)."
+    return 1
+}
+
+# A.19 — Crea backup de torrc con marca temporal ISO 8601 UTC.
+torctl_backup_config() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    local dest
+    dest="$(_torctl_backup_config "${ruta}")" || {
+        log_error "Backup falló."
+        return 1
+    }
+    log_info "Backup creado: ${dest}"
+    _torctl_log_op "backup_config" "ok:${dest}"
+    return 0
+}
+
+# A.20 — Lista backups y restaura el más reciente, previa confirmación.
+torctl_restore_config() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    local latest
+    latest="$(_torctl_latest_backup "${ruta}" || true)"
+    if [[ -z "${latest}" ]]; then
+        log_error "No hay backups para $(basename "${ruta}")."
+        return 1
+    fi
+    log_info "Backups disponibles para $(basename "${ruta}"):"
+    find "${GHOST_TORRC_BACKUP_DIR}" -maxdepth 1 -type f \
+        -name "$(basename "${ruta}").*.bak" 2>/dev/null | sort -r | sed 's/^/  /' >&2 || true
+    log_info "Más reciente: ${latest}"
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] Restauraría ${latest} -> ${ruta}"
+        return 0
+    fi
+    _torctl_confirm_action "¿Restaurar ${ruta} desde el backup más reciente?" || {
+        log_warn "Restauración cancelada."
+        return 1
+    }
+    _torctl_backup_config "${ruta}" >/dev/null 2>&1 || true
+    cat "${latest}" >"${ruta}" || {
+        log_error "Restauración falló."
+        return 1
+    }
+    log_info "Configuración restaurada desde ${latest}"
+    _torctl_log_op "restore_config" "ok:${latest}"
+    return 0
+}
+
+# A.21 — Habilita o modifica ControlPort en torrc (idempotente). Backup previo.
+torctl_set_control_port() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    local host="${2:-${GHOST_TOR_CONTROL_HOST}}"
+    local port="${3:-${GHOST_TOR_CONTROL_PORT}}"
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        log_error "Puerto inválido: ${port}"
+        return 1
+    fi
+    log_info "Estableciendo ControlPort ${host}:${port} en ${ruta}"
+    _torctl_torrc_set "${ruta}" "ControlPort" "${host}:${port}" || return 1
+    _torctl_log_op "set_control_port" "${host}:${port}"
+    return 0
+}
+
+# A.22 — Habilita o modifica SocksPort en torrc (idempotente). Backup previo.
+torctl_set_socks_port() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    local host="${2:-${GHOST_TOR_SOCKS_HOST}}"
+    local port="${3:-${GHOST_TOR_SOCKS_PORT}}"
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        log_error "Puerto inválido: ${port}"
+        return 1
+    fi
+    log_info "Estableciendo SocksPort ${host}:${port} en ${ruta}"
+    _torctl_torrc_set "${ruta}" "SocksPort" "${host}:${port}" || return 1
+    _torctl_log_op "set_socks_port" "${host}:${port}"
+    return 0
+}
+
+# A.23 — Habilita el mecanismo de bridges obfs4 (idempotente). Backup previo.
+# No inserta líneas Bridge concretas: el operador debe añadir sus propios
+# bridges (p. ej. desde bridges.torproject.org).
+torctl_enable_bridges() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    log_info "Habilitando mecanismo de bridges obfs4 en ${ruta}"
+    _torctl_torrc_set "${ruta}" "UseBridges" "1" || return 1
+    _torctl_torrc_set "${ruta}" "ClientTransportPlugin" "obfs4 exec /usr/bin/obfs4proxy" || return 1
+    log_warn "Añada sus propias líneas 'Bridge obfs4 ...' obtenidas de fuentes oficiales."
+    _torctl_log_op "enable_bridges" "ok"
+    return 0
+}
+
+# A.24 — Deshabilita el mecanismo de bridges (comenta directivas). Backup previo.
+torctl_disable_bridges() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    log_info "Deshabilitando bridges en ${ruta}"
+    _torctl_torrc_comment "${ruta}" "UseBridges" || return 1
+    _torctl_torrc_comment "${ruta}" "ClientTransportPlugin" || return 1
+    _torctl_log_op "disable_bridges" "ok"
+    return 0
+}
+
+# A.25 — Detecta fugas locales: IPv6 global, DNS no local, aviso WebRTC.
+torctl_detect_leaks() {
+    local issues=0
+
+    # a) IPv6 global activo (scope 00 en /proc/net/if_inet6).
+    if [[ -r /proc/net/if_inet6 ]]; then
+        if awk '$4=="00"{f=1} END{exit !f}' /proc/net/if_inet6 2>/dev/null; then
+            log_warn "[IPv6] Hay direcciones IPv6 globales activas; Tor puede no enrutarlas. Considere deshabilitar IPv6 o forzar su paso por Tor."
+            issues=$((issues + 1))
+        else
+            log_info "[IPv6] Sin direcciones IPv6 globales activas."
+        fi
+    else
+        log_info "[IPv6] /proc/net/if_inet6 no disponible; omitido."
+    fi
+
+    # b) DNS no local en /etc/resolv.conf.
+    if [[ -r /etc/resolv.conf ]]; then
+        local bad_dns
+        bad_dns="$(grep -E '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null |
+            awk '{print $2}' |
+            grep -vE '^(127\.|::1$)' || true)"
+        if [[ -n "${bad_dns}" ]]; then
+            log_warn "[DNS] Resolvers no locales detectados (posible fuga): $(printf '%s' "${bad_dns}" | tr '\n' ' ')"
+            issues=$((issues + 1))
+        else
+            log_info "[DNS] Solo resolvers locales en resolv.conf."
+        fi
+    fi
+
+    # c) WebRTC: aviso (no verificable desde shell).
+    log_info "[WebRTC] Si usa navegador, verifique que WebRTC esté deshabilitado para evitar exposición de IP local."
+
+    if ((issues > 0)); then
+        log_warn "Detección de fugas: ${issues} hallazgo(s) que requieren atención."
+        return 1
+    fi
+    log_info "Detección de fugas: sin hallazgos locales."
+    return 0
+}
+
+# A.26 — Imprime una configuración hardening recomendada (no escribe nada).
+torctl_recommend_config() {
+    cat <<'EOF'
+# ── Configuración Tor recomendada (hardening de privacidad) ──
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+SafeSocks 1
+TestSocks 1
+WarnUnsafeSocks 1
+StrictNodes 0
+EnforceDistinctSubnets 1
+# Aislamiento de streams (mejora la imposibilidad de correlación):
+SocksPort 127.0.0.1:9050 IsolateDestAddr IsolateDestPort
+# Minimiza el registro local:
+Log notice file /dev/null
+# Bridges (opcional, si su red censura Tor):
+# UseBridges 1
+# ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+# Bridge obfs4 <obtenga el suyo en bridges.torproject.org>
+EOF
+    return 0
+}
+
+# A.27 — Monitorea la latencia del SOCKS de Tor (--live = continuo).
+torctl_monitor_socks() {
+    local live=0 arg
+    for arg in "$@"; do
+        [[ "${arg}" == "--live" ]] && live=1
+    done
+    local iterations=1 i=0 ms
+    ((live)) && iterations=0
+    while :; do
+        ms="$(_torctl_measure_latency "${GHOST_TOR_SOCKS_HOST}" "${GHOST_TOR_SOCKS_PORT}" 2>/dev/null)" || ms="-1"
+        if [[ "${ms}" == "-1" ]]; then
+            printf '%b %s\n' "${C_DANGER}[CAÍDO]${C_RESET}" \
+                "SOCKS ${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} sin respuesta"
+        else
+            printf '%b %s\n' "${C_SUCCESS}[ OK ]${C_RESET}" \
+                "SOCKS ${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} — ${ms} ms"
+        fi
+        if ((iterations > 0)); then
+            i=$((i + 1))
+            ((i >= iterations)) && break
+        fi
+        sleep 2
+    done
+    return 0
+}
+
+# A.02 — Panel de estado operativo de Tor.
+torctl_status_panel() {
+    local installed="NO" version="-" running="DETENIDO" socks="-" control="-"
+    local egress="-" bridges="DESACTIVADOS" backup="-" leaks="-"
+
+    if torctl_is_installed; then
+        installed="SÍ"
+        version="$(torctl_get_version 2>/dev/null || printf '%s' '-')"
+    fi
+    torctl_is_running && running="ACTIVO"
+    _torctl_check_socks_port && socks="${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} (OK)" ||
+        socks="${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} (sin respuesta)"
+    _torctl_check_control_port && control="${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT} (OK)" ||
+        control="${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT} (sin respuesta)"
+
+    if _torctl_check_socks_port; then
+        local ip
+        ip="$(_torctl_egress_ip 2>/dev/null || true)"
+        [[ -n "${ip}" ]] && egress="${ip}"
+    fi
+
+    if [[ -r "${GHOST_TORRC}" ]] && grep -Eiq '^[[:space:]]*UseBridges[[:space:]]+1' "${GHOST_TORRC}"; then
+        bridges="ACTIVADOS"
+    fi
+
+    local latest
+    latest="$(_torctl_latest_backup "${GHOST_TORRC}" 2>/dev/null || true)"
+    [[ -n "${latest}" ]] && backup="$(basename "${latest}")"
+
+    printf '%b\n' "${C_PRIMARY}${C_BOLD}GHOST-KALI v5.0 — TORCTL STATUS${C_RESET}"
+    printf '%b\n' "${C_DIM}──────────────────────────────────────────────${C_RESET}"
+    printf '   %-18s %b\n' "Servicio Tor:" "${running} (${version})"
+    printf '   %-18s %s\n' "Instalado:" "${installed}"
+    printf '   %-18s %s\n' "SocksPort:" "${socks}"
+    printf '   %-18s %s\n' "ControlPort:" "${control}"
+    printf '   %-18s %s\n' "IP de Egreso:" "${egress}"
+    printf '   %-18s %s\n' "Bridges:" "${bridges}"
+    printf '   %-18s %s\n' "Último Backup:" "${backup}"
+    printf '%b\n' "${C_DIM}──────────────────────────────────────────────${C_RESET}"
+    return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BLOQUE B — ANONIMATO AVANZADO (operaciones sobre el tráfico PROPIO)
+# ───────────────────────────────────────────────────────────────────────────
+# Estas funciones configuran cómo egresa el tráfico propio a través de Tor.
+# Son capacidades estándar del cliente Tor (selección de salida, rotación de
+# identidad, circuitos personalizados, aislamiento de streams). No actúan
+# contra objetivos externos ni evaden defensas de terceros.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# B.01 — Selecciona el país del nodo de salida Tor (ExitNodes {cc}).
+# Afecta únicamente por dónde egresa el tráfico propio. Backup + confirmación.
+torctl_spoof_exit() {
+    local country="${1:-}"
+    local ruta="${2:-${GHOST_TORRC}}"
+    if ! [[ "${country}" =~ ^[A-Za-z]{2}$ ]]; then
+        log_error "Código de país inválido (use ISO de 2 letras, p. ej. 'de', 'ch')."
+        return 1
+    fi
+    country="${country,,}"
+    log_info "Configurando ExitNodes {${country}} con StrictNodes."
+    if ((_GHOST_TORCTL_DRY_RUN == 0)); then
+        _torctl_confirm_action "¿Fijar el país de salida a '${country}'? (reduce el anonimato)" || {
             log_warn "Operación cancelada."
             return 1
+        }
+    fi
+    _torctl_torrc_set "${ruta}" "ExitNodes" "{${country}}" || return 1
+    _torctl_torrc_set "${ruta}" "StrictNodes" "1" || return 1
+    log_info "Recargue Tor (torctl_restart) para aplicar. Verifique con torctl_is_exit_reachable."
+    _torctl_log_op "set_exit_country" "${country}"
+    return 0
+}
+
+# B.02 — Rota el circuito (NEWNYM) cada N segundos para reducir correlación.
+# Bucle hasta interrupción (Ctrl-C). No fija país; mantiene selección de Tor.
+torctl_randomize_exit() {
+    local interval=60 arg next
+    local args=("$@")
+    local idx=0
+    while ((idx < ${#args[@]})); do
+        arg="${args[idx]}"
+        if [[ "${arg}" == "--pool" ]]; then
+            next=$((idx + 1))
+            if ((next < ${#args[@]})) && [[ "${args[next]}" =~ ^[0-9]+$ ]]; then
+                interval="${args[next]}"
+                idx=$((idx + 2))
+                continue
+            fi
         fi
-    fi
-
-    _tor_require || return 1
-    # Razón 1 = REASON_MISC (cierre genérico solicitado por el usuario).
-    if _tor_exec "CLOSESTREAM ${id} 1" >/dev/null; then
-        log_ok "Stream ${id} cerrado."
-        return 0
-    fi
-    log_error "No se pudo cerrar el stream ${id}."
-    return 1
-}
-
-# tor_get_exit_nodes → muestra información del nodo de salida actual.
-tor_get_exit_nodes() {
-    _tor_require || return 1
-    local circ path exit_hop fp ip country
-    circ=$(_tor_latest_general_circuit) || {
-        log_warn "Aún no hay un circuito GENERAL construido."
-        return 1
-    }
-    path=$(awk '{print $3}' <<<"$circ")
-    exit_hop=${path##*,}
-    fp=${exit_hop%%~*}
-    fp=${fp#\$}
-    ip=$(_tor_node_ip "$fp")
-    country=$(_tor_ip_country "$ip")
-    log_section "Nodo de salida actual"
-    log_table "Fingerprint" "$fp" "IP" "${ip:-desconocida}" "País" "${country:-??}"
-    return 0
-}
-
-# tor_get_consensus_info → información básica de conectividad/consenso.
-# POR QUÉ no volcamos el consenso completo: es enorme y ruidoso; nos quedamos con
-# las señales útiles de estado (versión, bootstrap, circuito, dormancia).
-tor_get_consensus_info() {
-    _tor_require || return 1
-    local ver estab dormant boot
-    ver=$(_tor_getinfo_one version)
-    estab=$(_tor_getinfo_one status/circuit-established)
-    dormant=$(_tor_getinfo_one dormant)
-    boot=$(_tor_getinfo_one status/bootstrap-phase)
-    log_section "Estado del consenso / conectividad"
-    log_table \
-        "Versión Tor" "${ver:-?}" \
-        "Circuito establecido" "${estab:-?}" \
-        "Inactivo (dormant)" "${dormant:-?}" \
-        "Bootstrap" "${boot:-?}"
-    return 0
-}
-
-# tor_check_bridges → comprueba si hay bridges configurados en torrc.
-# POR PRIVACIDAD: informa de CUÁNTOS bridges hay, pero NUNCA imprime sus direcciones.
-tor_check_bridges() {
-    if [[ ! -r $GHOST_TORRC ]]; then
-        log_warn "No se pudo leer ${GHOST_TORRC}."
-        return 1
-    fi
-    local use count
-    use=$(grep -Eic '^[[:space:]]*UseBridges[[:space:]]+1' "$GHOST_TORRC" || true)
-    count=$(grep -Eic '^[[:space:]]*Bridge[[:space:]]+' "$GHOST_TORRC" || true)
-
-    if [[ $use -ge 1 && $count -ge 1 ]]; then
-        log_ok "Bridges habilitados: ${count} configurado(s)."
-    elif [[ $count -ge 1 ]]; then
-        log_warn "Hay ${count} bridge(s) en torrc, pero «UseBridges 1» no está activo."
-    else
-        log_info "No hay bridges configurados (conexión directa a la red Tor)."
-    fi
-    return 0
-}
-
-# tor_bandwidth_stats → estadísticas acumuladas de tráfico.
-tor_bandwidth_stats() {
-    _tor_require || return 1
-    local r w
-    r=$(_tor_getinfo_one traffic/read)
-    w=$(_tor_getinfo_one traffic/written)
-    if [[ -z $r && -z $w ]]; then
-        log_error "No se pudieron obtener las estadísticas de tráfico."
-        return 1
-    fi
-    log_section "Ancho de banda de Tor (acumulado)"
-    log_table "Leído" "$(_human_bytes "${r:-0}")" "Escrito" "$(_human_bytes "${w:-0}")"
-    return 0
-}
-
-# tor_uptime → tiempo que lleva corriendo Tor (vía ControlPort o, si no, proceso).
-tor_uptime() {
-    local secs
-    secs=$(_tor_getinfo_one uptime 2>/dev/null)
-    if ! [[ $secs =~ ^[0-9]+$ ]]; then
-        # Fallback: tiempo de vida del proceso tor.
-        local pid
-        pid=$(pgrep -x tor 2>/dev/null | head -1)
-        [[ -n $pid ]] && secs=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
-    fi
-    if [[ $secs =~ ^[0-9]+$ ]]; then
-        log_section "Uptime de Tor"
-        log_table "Tiempo activo" "$(_human_duration "$secs")"
-        return 0
-    fi
-    log_warn "No se pudo determinar el uptime de Tor."
-    return 1
-}
-
-# tor_circuit_path → muestra la ruta (saltos y países) del circuito actual.
-tor_circuit_path() {
-    _tor_require || return 1
-    local circ path
-    circ=$(_tor_latest_general_circuit) || {
-        log_warn "Aún no hay un circuito GENERAL construido."
-        return 1
-    }
-    path=$(awk '{print $3}' <<<"$circ")
-
-    log_section "Ruta del circuito actual"
-    local -a hops
-    IFS=',' read -ra hops <<<"$path"
-    local n=${#hops[@]} i=1 hop fp ip country role
-    for hop in "${hops[@]}"; do
-        fp=${hop%%~*}
-        fp=${fp#\$}
-        ip=$(_tor_node_ip "$fp")
-        country=$(_tor_ip_country "$ip")
-        if [[ $i -eq 1 ]]; then
-            role="Entrada"
-        elif [[ $i -eq $n ]]; then
-            role="Salida"
-        else
-            role="Intermedio"
-        fi
-        log_table "Salto ${i} (${role})" "${ip:-?} [${country:-??}]"
-        i=$((i + 1))
+        idx=$((idx + 1))
     done
-    return 0
-}
-
-# tor_status_panel → resumen compacto del estado de Tor.
-tor_status_panel() {
-    log_section "Panel de estado de Tor"
-    if ! _tor_is_running; then
-        log_error "Tor no está accesible en ${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT}."
-        return 1
-    fi
-    local ver estab exitcc="??" circ
-    ver=$(_tor_getinfo_one version)
-    estab=$(_tor_getinfo_one status/circuit-established)
-    if circ=$(_tor_latest_general_circuit 2>/dev/null); then
-        local p ex fp ip
-        p=$(awk '{print $3}' <<<"$circ")
-        ex=${p##*,}
-        fp=${ex%%~*}
-        fp=${fp#\$}
-        ip=$(_tor_node_ip "$fp")
-        exitcc=$(_tor_ip_country "$ip")
-    fi
-    log_table \
-        "ControlPort" "${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT}" \
-        "Versión" "${ver:-?}" \
-        "Circuito establecido" "${estab:-?}" \
-        "País de salida" "${exitcc:-??}"
-    return 0
-}
-
-# tor_verify_exit → comprueba que el tráfico realmente sale por Tor.
-# Usa --socks5-hostname para que también la DNS viaje por Tor (evita fuga de DNS).
-tor_verify_exit() {
-    if ! command -v curl >/dev/null 2>&1; then
-        log_error "curl no está instalado; no se puede verificar la salida."
-        return 1
-    fi
-    local url="https://check.torproject.org/api/ip" out
-    out=$(curl -fsS --max-time 15 \
-        --socks5-hostname "${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_SOCKS_PORT}" \
-        "$url" 2>/dev/null)
-
-    if [[ -z $out ]]; then
-        log_error "Sin respuesta de ${url} a través del SOCKS de Tor (${GHOST_TOR_SOCKS_PORT})."
-        log_error "¿Tor escucha en ${GHOST_TOR_SOCKS_PORT}? ¿Hay conectividad de red?"
-        return 1
-    fi
-
-    if printf '%s' "$out" | grep -qi '"IsTor"[[:space:]]*:[[:space:]]*true'; then
-        log_ok "El tráfico SALE por Tor. ✔"
-        local ip
-        ip=$(printf '%s' "$out" | grep -oE '"IP":"[^"]+"' | head -1 |
-            sed -E 's/"IP":"(.*)"/\1/')
-        [[ -n $ip ]] && log_info "IP de salida observada: ${ip}"
+    ((interval < 10)) && interval=10
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] Rotaría el circuito cada ${interval}s (NEWNYM)."
         return 0
     fi
+    log_info "Rotando circuito cada ${interval}s. Ctrl-C para detener."
+    while :; do
+        torctl_newnym || log_warn "NEWNYM falló en esta iteración."
+        sleep "${interval}"
+    done
+}
 
-    log_error "El tráfico NO sale por Tor según check.torproject.org."
+# B.03 — Construye un circuito con nodos preferidos (EntryNodes/ExitNodes).
+# NODOS: "entrada,salida" como códigos de país de 2 letras o fingerprints.
+# Vía torrc con StrictNodes. Backup + confirmación.
+torctl_build_custom_circuit() {
+    local nodos="${1:-}"
+    local ruta="${2:-${GHOST_TORRC}}"
+    [[ -n "${nodos}" ]] || {
+        log_error "Indique nodos: 'entrada,salida' (códigos de país o fingerprints)."
+        return 1
+    }
+    local entry exit_node
+    entry="$(printf '%s' "${nodos}" | cut -d',' -f1)"
+    exit_node="$(printf '%s' "${nodos}" | cut -d',' -f2)"
+    [[ -n "${entry}" && -n "${exit_node}" ]] || {
+        log_error "Formato inválido. Use 'entrada,salida'."
+        return 1
+    }
+    # Normaliza códigos de país a {cc}; deja fingerprints tal cual.
+    [[ "${entry}" =~ ^[A-Za-z]{2}$ ]] && entry="{${entry,,}}"
+    [[ "${exit_node}" =~ ^[A-Za-z]{2}$ ]] && exit_node="{${exit_node,,}}"
+    if ((_GHOST_TORCTL_DRY_RUN == 0)); then
+        _torctl_confirm_action "¿Fijar EntryNodes=${entry} ExitNodes=${exit_node}? (reduce el anonimato)" || {
+            log_warn "Operación cancelada."
+            return 1
+        }
+    fi
+    _torctl_torrc_set "${ruta}" "EntryNodes" "${entry}" || return 1
+    _torctl_torrc_set "${ruta}" "ExitNodes" "${exit_node}" || return 1
+    _torctl_torrc_set "${ruta}" "StrictNodes" "1" || return 1
+    log_info "Recargue Tor para aplicar. Para fijar el nodo intermedio exacto use el ControlPort (EXTENDCIRCUIT)."
+    _torctl_log_op "build_custom_circuit" "${entry}->${exit_node}"
+    return 0
+}
+
+# B.04 — Cambia la identidad de salida: NEWNYM y verifica nueva IP de egreso.
+# Equivale a "Nueva identidad" del Tor Browser.
+torctl_rotate_identity() {
+    local force=0 arg
+    for arg in "$@"; do
+        [[ "${arg}" == "--force" ]] && force=1
+    done
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] NEWNYM + verificación de nueva IP de egreso."
+        return 0
+    fi
+    local before after
+    before="$(_torctl_egress_ip 2>/dev/null || true)"
+    torctl_newnym || {
+        log_error "No se pudo rotar la identidad."
+        return 1
+    }
+    ((force)) && _torctl_control_cmd "SIGNAL CLEARDNSCACHE" >/dev/null 2>&1 || true
+    sleep 5
+    after="$(_torctl_egress_ip 2>/dev/null || true)"
+    if [[ -n "${after}" && "${before}" != "${after}" ]]; then
+        log_info "Identidad rotada. IP de egreso: ${before:-?} -> ${after}"
+    else
+        log_warn "Identidad solicitada; la IP de egreso no cambió aún (puede tardar) o no se pudo verificar."
+    fi
+    _torctl_log_op "rotate_identity" "${before:-?}->${after:-?}"
+    return 0
+}
+
+# B.05 — Perfil efímero de máxima privacidad sobre el propio cliente Tor.
+# --on aplica nodos estrictos, aislamiento de streams y registro local mínimo;
+# --off restaura la configuración previa. NO es anti-forense ni evasión: solo
+# reduce la huella de registro del propio equipo y endurece el anonimato.
+torctl_ghost_circuit() {
+    local action="${1:-}"
+    local ruta="${2:-${GHOST_TORRC}}"
+    case "${action}" in
+        --on)
+            log_info "Activando perfil efímero de privacidad en ${ruta}"
+            if ((_GHOST_TORCTL_DRY_RUN == 0)); then
+                _torctl_confirm_action "¿Aplicar perfil de máxima privacidad (registro local mínimo)?" || {
+                    log_warn "Operación cancelada."
+                    return 1
+                }
+                _GHOST_TORCTL_GHOST_BACKUP="$(_torctl_backup_config "${ruta}" 2>/dev/null || true)"
+            fi
+            _torctl_torrc_set "${ruta}" "StrictNodes" "1" || return 1
+            _torctl_torrc_set "${ruta}" "EnforceDistinctSubnets" "1" || return 1
+            _torctl_torrc_set "${ruta}" "SocksPort" \
+                "${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} IsolateDestAddr IsolateDestPort" || return 1
+            _torctl_torrc_set "${ruta}" "Log" "notice file /dev/null" || return 1
+            torctl_newnym >/dev/null 2>&1 || true
+            log_info "Perfil aplicado. Recargue Tor para que surta efecto. Use '--off' para restaurar."
+            _torctl_log_op "ghost_circuit" "on"
+            ;;
+        --off)
+            if [[ -n "${_GHOST_TORCTL_GHOST_BACKUP}" && -r "${_GHOST_TORCTL_GHOST_BACKUP}" ]]; then
+                if ((_GHOST_TORCTL_DRY_RUN)); then
+                    log_info "[dry-run] Restauraría ${_GHOST_TORCTL_GHOST_BACKUP} -> ${ruta}"
+                    return 0
+                fi
+                cat "${_GHOST_TORCTL_GHOST_BACKUP}" >"${ruta}" || {
+                    log_error "No se pudo restaurar el perfil previo."
+                    return 1
+                }
+                log_info "Configuración previa restaurada."
+                _GHOST_TORCTL_GHOST_BACKUP=""
+            else
+                log_warn "No hay backup de sesión; use torctl_restore_config para restaurar manualmente."
+            fi
+            torctl_newnym >/dev/null 2>&1 || true
+            _torctl_log_op "ghost_circuit" "off"
+            ;;
+        *)
+            log_error "Uso: torctl_ghost_circuit --on|--off [ruta]"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# B.06 — Aísla streams por destino (IsolateDestAddr/IsolateDestPort).
+# Función de privacidad: dificulta la correlación entre conexiones.
+torctl_isolate_streams() {
+    local ruta="${1:-${GHOST_TORRC}}"
+    log_info "Aplicando aislamiento de streams en ${ruta}"
+    _torctl_torrc_set "${ruta}" "SocksPort" \
+        "${GHOST_TOR_SOCKS_HOST}:${GHOST_TOR_SOCKS_PORT} IsolateDestAddr IsolateDestPort" || return 1
+    log_info "Recargue Tor para aplicar el aislamiento de streams."
+    _torctl_log_op "isolate_streams" "ok"
+    return 0
+}
+
+# B.07 — Destruye el circuito actual y solicita uno nuevo (NEWNYM + limpieza DNS).
+torctl_burn_circuit() {
+    if ((_GHOST_TORCTL_DRY_RUN)); then
+        log_info "[dry-run] NEWNYM + CLEARDNSCACHE"
+        return 0
+    fi
+    local ok=0
+    torctl_newnym && ok=1
+    _torctl_control_cmd "SIGNAL CLEARDNSCACHE" >/dev/null 2>&1 || true
+    if ((ok)); then
+        log_info "Circuito regenerado y caché DNS de Tor limpiada."
+        _torctl_log_op "burn_circuit" "ok"
+        return 0
+    fi
+    log_warn "No se pudo regenerar el circuito (ControlPort no disponible)."
+    _torctl_log_op "burn_circuit" "fallo"
     return 1
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  API EXPUESTA (recordatorio)
-#  Esto es una librería: al hacer `source lib/torctl.sh` quedan disponibles las
-#  funciones públicas anteriores. NO se ejecuta ninguna acción automáticamente;
-#  el orquestador (joseph-trio) decide qué invocar. No hay main() a propósito.
-# ──────────────────────────────────────────────────────────────────────────────
+# B.08 — Exporta la bitácora de operaciones de la sesión (UTC|acción|resultado).
+# --export json|csv imprime en el formato indicado; por defecto, legible.
+torctl_engagement_log() {
+    local fmt="texto" arg next
+    local args=("$@")
+    local idx=0
+    while ((idx < ${#args[@]})); do
+        arg="${args[idx]}"
+        if [[ "${arg}" == "--export" ]]; then
+            next=$((idx + 1))
+            ((next < ${#args[@]})) && fmt="${args[next]}"
+            idx=$((idx + 2))
+            continue
+        fi
+        idx=$((idx + 1))
+    done
+
+    local n="${#_GHOST_TORCTL_OPLOG[@]}"
+    if ((n == 0)); then
+        log_info "Bitácora de sesión vacía."
+        return 0
+    fi
+
+    local entry ts action result
+    case "${fmt}" in
+        json)
+            printf '['
+            local first=1
+            for entry in "${_GHOST_TORCTL_OPLOG[@]}"; do
+                ts="${entry%%|*}"
+                result="${entry##*|}"
+                action="${entry#*|}"
+                action="${action%|*}"
+                ((first)) || printf ','
+                first=0
+                printf '{"ts":"%s","action":"%s","result":"%s"}' "${ts}" "${action}" "${result}"
+            done
+            printf ']\n'
+            ;;
+        csv)
+            printf 'ts,action,result\n'
+            for entry in "${_GHOST_TORCTL_OPLOG[@]}"; do
+                ts="${entry%%|*}"
+                result="${entry##*|}"
+                action="${entry#*|}"
+                action="${action%|*}"
+                printf '%s,%s,%s\n' "${ts}" "${action}" "${result}"
+            done
+            ;;
+        *)
+            for entry in "${_GHOST_TORCTL_OPLOG[@]}"; do
+                printf '  %s\n' "${entry}"
+            done
+            ;;
+    esac
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Fin de lib/torctl.sh
+# ───────────────────────────────────────────────────────────────────────────

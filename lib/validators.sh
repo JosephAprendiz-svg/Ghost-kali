@@ -559,7 +559,7 @@ validate_is_readable() {
 # Verdadero si el valor no está vacío.
 validate_non_empty() {
     local value="${1:-}"
-    [[ -n "${value}" ]] && return 0
+    [[ -n "${value//[[:space:]]/}" ]] && return 0
     return 1
 }
 
@@ -600,13 +600,14 @@ validate_interface_exists() {
 # Verdadero si el puerto de Tor escucha en el host propio (127.0.0.1).
 # Restringido EXCLUSIVAMENTE a localhost: nunca contacta ni escanea a terceros.
 validate_tor_port() {
-    local port="${1:-${GHOST_TOR_SOCKS_PORT}}"
+    local host="${1:-127.0.0.1}"
+    local port="${2:-${GHOST_TOR_SOCKS_PORT}}"
     validate_port "${port}" || return 1
     if command -v nc >/dev/null 2>&1; then
-        nc -z -w 2 127.0.0.1 "${port}" >/dev/null 2>&1 && return 0
+        nc -z -w 2 "${host}" "${port}" >/dev/null 2>&1 && return 0
         return 1
     fi
-    (exec 3<>"/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1 && return 0
+    (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && return 0
     return 1
 }
 

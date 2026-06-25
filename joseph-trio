@@ -258,42 +258,32 @@ trio_check_health() {
 #  por el usuario (nunca indiscriminada), siempre con soporte de --dry-run.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# _trio_tor_start → inicia el servicio Tor (systemctl), respetando --dry-run.
+# _trio_tor_start → delega en torctl_start(), respetando GHOST_DRY_RUN.
 _trio_tor_start() {
-    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
-        log_info "[dry-run] Ejecutaría: systemctl start tor"
+    if [[ "${GHOST_DRY_RUN:-0}" == "1" ]]; then
+        log_info "[dry-run] torctl_start"
         return 0
     fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_error "systemctl no está disponible; inicia Tor manualmente."
+    if declare -F torctl_start >/dev/null 2>&1; then
+        torctl_start
+    else
+        log_error "torctl_start no disponible. Verifique lib/torctl.sh."
         return 1
     fi
-    log_info "Iniciando el servicio Tor…"
-    if systemctl start tor 2>/dev/null; then
-        log_ok "Servicio Tor iniciado."
-        return 0
-    fi
-    log_error "No se pudo iniciar Tor (¿está instalado? ¿tienes permisos?)."
-    return 1
 }
 
-# _trio_tor_stop → detiene el servicio Tor (acción explícita y confirmada).
+# _trio_tor_stop → delega en torctl_stop(), respetando GHOST_DRY_RUN.
 _trio_tor_stop() {
-    if [[ ${GHOST_DRY_RUN:-0} == 1 ]]; then
-        log_info "[dry-run] Ejecutaría: systemctl stop tor"
+    if [[ "${GHOST_DRY_RUN:-0}" == "1" ]]; then
+        log_info "[dry-run] torctl_stop"
         return 0
     fi
-    _trio_confirm "¿Detener el servicio Tor?" || return 1
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_error "systemctl no está disponible; detén Tor manualmente."
+    if declare -F torctl_stop >/dev/null 2>&1; then
+        torctl_stop
+    else
+        log_error "torctl_stop no disponible. Verifique lib/torctl.sh."
         return 1
     fi
-    if systemctl stop tor 2>/dev/null; then
-        log_ok "Servicio Tor detenido."
-        return 0
-    fi
-    log_error "No se pudo detener Tor."
-    return 1
 }
 
 # _trio_proxychains_conf → imprime la ruta del proxychains.conf legible, si existe.
@@ -566,8 +556,8 @@ _trio_menu_tor() {
         case ${c,,} in
             a) _trio_tor_start ;;
             b) _trio_tor_stop ;;
-            c) declare -F tor_newnym >/dev/null 2>&1 && tor_newnym ;;
-            d) declare -F tor_get_circuits >/dev/null 2>&1 && tor_get_circuits ;;
+            c) declare -F torctl_newnym >/dev/null 2>&1 && torctl_newnym ;;
+            d) declare -F torctl_get_circuit_info >/dev/null 2>&1 && torctl_get_circuit_info ;;
             0 | q) return 0 ;;
             *) log_warn "Opción inválida." ;;
         esac

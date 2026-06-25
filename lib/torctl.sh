@@ -324,8 +324,29 @@ _torctl_control_cmd() {
         log_error "ControlPort ${GHOST_TOR_CONTROL_HOST}:${GHOST_TOR_CONTROL_PORT} no responde"
         return 1
     }
+    # Buscar cookie de autenticacion de Tor en ubicaciones comunes.
+    local cookie_file=""
+    local f
+    for f in /run/tor/control.authcookie /var/lib/tor/control.authcookie /var/run/tor/control.authcookie; do
+        if [[ -r "${f}" ]]; then
+            cookie_file="${f}"
+            break
+        fi
+    done
+    local auth_line="AUTHENTICATE"
+    if [[ -n "${cookie_file}" ]]; then
+        local cookie_hex
+        if command -v xxd >/dev/null 2>&1; then
+            cookie_hex="$(xxd -p -c 256 "${cookie_file}" 2>/dev/null | tr -d '[:space:]')"
+        else
+            cookie_hex="$(od -An -tx1 "${cookie_file}" 2>/dev/null | tr -d '[:space:]')"
+        fi
+        if [[ -n "${cookie_hex}" ]]; then
+            auth_line="AUTHENTICATE ${cookie_hex}"
+        fi
+    fi
     local resp
-    resp="$(printf 'AUTHENTICATE\r\n%s\r\nQUIT\r\n' "${cmd}" |
+    resp="$(printf '%s\r\n%s\r\nQUIT\r\n' "${auth_line}" "${cmd}" |
         nc -w "${GHOST_TOR_TIMEOUT}" "${GHOST_TOR_CONTROL_HOST}" "${GHOST_TOR_CONTROL_PORT}" 2>/dev/null || true)"
     if [[ -z "${resp}" ]]; then
         log_error "Sin respuesta del ControlPort"

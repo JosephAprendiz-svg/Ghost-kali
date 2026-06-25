@@ -111,7 +111,7 @@ _trio_on_int() {
 # trio_load_libs → carga todas las librerías de lib/ en el orden de dependencias.
 trio_load_libs() {
     local lib path
-    local -a libs=(colors logger validators torctl vpnctl netutils dashboard banner)
+    local -a libs=(colors logger validators torctl vpnctl proxyctl netutils dashboard banner)
     local -a missing=()
     for lib in "${libs[@]}"; do
         path="${GHOST_LIB_DIR}/${lib}.sh"
@@ -447,8 +447,8 @@ trio_disconnect_all() {
 trio_status() {
     log_section "Estado del trio (Mullvad / Tor / Proxychains)"
     declare -F vpn_status_panel >/dev/null 2>&1 && vpn_status_panel
-    declare -F tor_status_panel >/dev/null 2>&1 && tor_status_panel
-    _trio_proxychains_check
+    declare -F torctl_status_panel >/dev/null 2>&1 && torctl_status_panel
+    declare -F proxyctl_status_panel >/dev/null 2>&1 && proxyctl_status_panel
     declare -F net_get_public_ip >/dev/null 2>&1 && net_get_public_ip
 }
 
